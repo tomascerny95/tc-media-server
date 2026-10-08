@@ -29,7 +29,6 @@ echo "  Target User           : $TARGET_USER"
 echo "=========================================================="
 
 echo "=== [1/6] Stopping existing services (Safe Update) ==="
-# Stop services before touching files to avoid file locking and race conditions
 if systemctl is-active --quiet tc-media-player.service 2>/dev/null; then
     echo "-> Stopping tc-media-player.service..."
     systemctl stop tc-media-player.service
@@ -41,7 +40,6 @@ if systemctl is-active --quiet qbittorrent.service 2>/dev/null; then
 fi
 
 echo "=== [2/6] Pulling latest code from Git ==="
-# If inside a Git repository, automatically pull updates under TARGET_USER
 if [ -d "$REPO_DIR/.git" ]; then
     echo "-> Checking for updates on GitHub..."
     sudo -u "$TARGET_USER" git -C "$REPO_DIR" pull || echo "-> Note: Local changes present or already up to date."
@@ -70,7 +68,6 @@ chown -R "${TARGET_USER}:${TARGET_USER}" "$REPO_DIR"
 echo "=== [5/6] Pre-configuring qBittorrent (IPv4, IPv6, Tailscale, .local) ==="
 mkdir -p "$QBIT_CONF_DIR"
 
-# Inject full authentication bypass (IPv4 + IPv6) and disable Host Header check
 CONF_PATH="$QBIT_CONF_FILE" python3 - << 'EOF'
 import os
 
@@ -80,7 +77,6 @@ os.makedirs(os.path.dirname(conf_path), exist_ok=True)
 lines = []
 if os.path.exists(conf_path):
     with open(conf_path, 'r', encoding='utf-8', errors='ignore') as f:
-        # Strip out old passwords, bans, and whitelist entries
         lines = [l for l in f if not any(k in l for k in [
             'WebUI\\AuthSubnetWhitelist',
             'WebUI\\Password',
@@ -90,7 +86,6 @@ if os.path.exists(conf_path):
             'WebUI\\CSRFProtection'
         ])]
 
-# Ensure [Preferences] section exists
 if not any('[Preferences]' in l for l in lines):
     lines.append('\n[Preferences]\n')
 
@@ -98,10 +93,8 @@ out = []
 for line in lines:
     out.append(line)
     if '[Preferences]' in line:
-        # Whitelist all IPv4 (0.0.0.0/0) and IPv6 (::/0) connections (Tailscale + mDNS)
         out.append('WebUI\\AuthSubnetWhitelist=0.0.0.0/0, ::/0\n')
         out.append('WebUI\\AuthSubnetWhitelistEnabled=true\n')
-        # Allow accessing via domains (.local, .ts.net) without header blocking
         out.append('WebUI\\HostHeaderValidation=false\n')
         out.append('WebUI\\BanDuration=0\n')
 
@@ -113,7 +106,7 @@ chown -R "${TARGET_USER}:${TARGET_USER}" "$QBIT_CONF_DIR"
 
 echo "=== [6/6] Starting services back up ==="
 
-# 1. qBittorrent service unit
+# 1. qBittorrent service unit (with --confirm-legal-notice for clean logs)
 cat << EOF > /etc/systemd/system/qbittorrent.service
 [Unit]
 Description=BitTorrent Client Daemon ($TARGET_USER)
@@ -124,14 +117,14 @@ Type=forking
 User=$TARGET_USER
 Group=$TARGET_USER
 UMask=002
-ExecStart=/usr/bin/qbittorrent-nox -d --webui-port=8080
+ExecStart=/usr/bin/qbittorrent-nox -d --confirm-legal-notice --webui-port=8080
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 2. TC-Media Video Player service unit (runs in-place from Git repo)
+# 2. TC-Media Video Player service unit
 cat << EOF > /etc/systemd/system/tc-media-player.service
 [Unit]
 Description=TC Media Web Video Player ($TARGET_USER)
