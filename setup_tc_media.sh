@@ -5,9 +5,9 @@ set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEDIA_DIR="/dlna"
 
-# Ensure script is run with root privileges
+# Ensure script is executed with root/sudo privileges
 if [ "$EUID" -ne 0 ]; then
-  echo "[!] Please run this script with root privileges: sudo ./setup_tc_media.sh"
+  echo "[!] Please run this script with root privileges: sudo bash ./setup_tc_media.sh"
   exit 1
 fi
 
@@ -29,7 +29,7 @@ echo "  Target User           : $TARGET_USER"
 echo "=========================================================="
 
 echo "=== [1/6] Stopping existing services (Safe Update) ==="
-# Stop services before updating code to prevent race conditions or locked files
+# Stop services before touching files to avoid file locking and race conditions
 if systemctl is-active --quiet tc-media-player.service 2>/dev/null; then
     echo "-> Stopping tc-media-player.service..."
     systemctl stop tc-media-player.service
@@ -58,16 +58,19 @@ apt update
 apt install -y qbittorrent-nox python3
 
 echo "=== [4/6] Configuring directory permissions ==="
+# Setup /dlna shared media storage
 mkdir -p "$MEDIA_DIR"
 chown -R "${TARGET_USER}:${TARGET_USER}" "$MEDIA_DIR"
 chmod -R 775 "$MEDIA_DIR"
 
+# Ensure repo files are executable and owned by TARGET_USER
 chmod +x "$REPO_DIR/server.py"
 chown -R "${TARGET_USER}:${TARGET_USER}" "$REPO_DIR"
 
-echo "=== [5/6] Pre-configuring qBittorrent (Passwordless WebUI) ==="
+echo "=== [5/6] Pre-configuring qBittorrent (IPv4, IPv6, Tailscale, .local) ==="
 mkdir -p "$QBIT_CONF_DIR"
 
+# Inject full authentication bypass (IPv4 + IPv6) and disable Host Header check
 CONF_PATH="$QBIT_CONF_FILE" python3 - << 'EOF'
 import os
 
@@ -77,13 +80,17 @@ os.makedirs(os.path.dirname(conf_path), exist_ok=True)
 lines = []
 if os.path.exists(conf_path):
     with open(conf_path, 'r', encoding='utf-8', errors='ignore') as f:
+        # Strip out old passwords, bans, and whitelist entries
         lines = [l for l in f if not any(k in l for k in [
             'WebUI\\AuthSubnetWhitelist',
             'WebUI\\Password',
             'WebUI\\BanDuration',
-            'WebUI\\MaxAuthFailCount'
+            'WebUI\\MaxAuthFailCount',
+            'WebUI\\HostHeaderValidation',
+            'WebUI\\CSRFProtection'
         ])]
 
+# Ensure [Preferences] section exists
 if not any('[Preferences]' in l for l in lines):
     lines.append('\n[Preferences]\n')
 
@@ -91,8 +98,11 @@ out = []
 for line in lines:
     out.append(line)
     if '[Preferences]' in line:
-        out.append('WebUI\\AuthSubnetWhitelist=0.0.0.0/0\n')
+        # Whitelist all IPv4 (0.0.0.0/0) and IPv6 (::/0) connections (Tailscale + mDNS)
+        out.append('WebUI\\AuthSubnetWhitelist=0.0.0.0/0, ::/0\n')
         out.append('WebUI\\AuthSubnetWhitelistEnabled=true\n')
+        # Allow accessing via domains (.local, .ts.net) without header blocking
+        out.append('WebUI\\HostHeaderValidation=false\n')
         out.append('WebUI\\BanDuration=0\n')
 
 with open(conf_path, 'w', encoding='utf-8') as f:
@@ -121,7 +131,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 2. TC-Media Video Player service unit
+# 2. TC-Media Video Player service unit (runs in-place from Git repo)
 cat << EOF > /etc/systemd/system/tc-media-player.service
 [Unit]
 Description=TC Media Web Video Player ($TARGET_USER)
@@ -153,8 +163,14 @@ IP_ADDR=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo "=========================================================="
-echo " Update complete! Both services are back ONLINE."
+echo " Setup complete! Running in-place from: $REPO_DIR"
 echo "=========================================================="
 echo " 1. Web Video Player : http://${IP_ADDR}:5000"
+echo "    -> Streaming from: $MEDIA_DIR"
+echo ""
 echo " 2. qBittorrent WebUI: http://${IP_ADDR}:8080"
+echo "    -> Access via    : IP, tc-media.local, or Tailscale (.ts.net)"
+echo "    -> Status        : Automatically authenticated (No password)"
+echo "    -> Remember to   : Set Default Save Path to $MEDIA_DIR"
+echo "                       (Options -> Downloads -> Default Save Path)"
 echo "=========================================================="
