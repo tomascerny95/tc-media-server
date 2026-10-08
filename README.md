@@ -1,88 +1,78 @@
-# TC-Media Server Setup Guide
+# TC-Media Server
 
-## Advantages of this Setup
+A lightweight, headless media server optimized for **Raspberry Pi** and Linux, running directly from the local Git repository.
 
-- **Low Resource Overhead:** Using `qbittorrent-nox` (headless) and `minidlna` ensures the Raspberry Pi remains fast and responsive, as there is no heavy desktop GUI running.
-- **Centralized Storage:** All your media is stored in one place (`/home/qbittorrent/Downloads`), making it easy to manage and back up.
-- **Universal Compatibility:** DLNA is supported by almost all Smart TVs, game consoles, and mobile apps (like VLC), meaning no extra software is needed on your playback devices.
-- **Privacy & Control:** You own the hardware and the data. There are no subscription fees or third-party tracking involved in your local streaming.
-- **Automated Management:** With `systemd`, both the torrent client and the media server start automatically on boot, making it a set-and-forget solution.
+- **qBittorrent-nox** on port `8080` (headless torrent management)
+- **Web Video Player** on port `5000` (pure Python video player with subtitle support & HTTP 206 Range seeking)
+- Shared media directory at `/dlna` with automated permissions
 
+---
 
-This guide covers the installation and configuration of a headless media server using **qBittorrent-nox** and **MiniDLNA** on a Raspberry Pi / Debian-based system.
+## ⚡ Features
+- **Extremely Low Footprint**: Zero heavy database or indexing overhead (no DLNA/Plex/Jellyfin daemon bloat).
+- **HTTP 206 Partial Content**: Smooth scrubbing and seeking support directly in the browser HTML5 player.
+- **On-the-Fly Subtitle Parsing**: Automatically discovers `.srt` and `.vtt` subtitles, converting SRT to WebVTT dynamically.
+- **In-Place Git Execution**: Runs straight from the cloned Git directory—seamless updates via `git pull`.
 
-## 1. qBittorrent-nox Setup
+---
 
-### Installation
+## 🚀 Installation on Raspberry Pi
+
+The player runs directly from the cloned repository folder without needing extra build steps or system-wide copying:
+
 ```bash
-sudo apt update
-sudo apt install qbittorrent-nox
+# 1. Clone repository to your home directory
+cd ~
+git clone https://github.com/tomascerny95/tc-media-server.git
+
+# 2. Enter folder and execute installer
+cd tc-media-server
+chmod +x setup_tc_media.sh
+sudo ./setup_tc_media.sh
 ```
 
-### User & Permissions
-Create a dedicated user for qBittorrent and add your main user to the group:
+---
+
+## 🌐 Web Interfaces
+
+| Service | Address | Description |
+|---|---|---|
+| **Web Video Player** | `http://<RPI_IP>:5000` | Stream videos and subtitles from `/dlna` |
+| **qBittorrent WebUI** | `http://<RPI_IP>:8080` | Manage torrent downloads |
+
+> **Post-Installation Step:**  
+> Open the qBittorrent WebUI (`http://<RPI_IP>:8080`), navigate to **Tools ➔ Options ➔ Downloads**, and set the **Default Save Path** to `/dlna`.
+
+---
+
+## 🔄 Updating
+
+Since the application runs directly from this repository, updating to the latest version takes just two commands:
+
 ```bash
-sudo useradd -r -m qbittorrent
-sudo usermod -a -G qbittorrent !!!!!!!!!!!!!USERNAME!!!!!!!!!!!!!
+cd ~/tc-media-server
+git pull
+sudo systemctl restart tc-media-player
 ```
 
-### Systemd Service Configuration
-Create the service file at `/etc/systemd/system/qbittorrent.service`:
-```ini
-[Unit]
-Description=BitTorrent Client
-After=network.target
+---
 
-[Service]
-Type=forking
-User=qbittorrent
-Group=qbittorrent
-UMask=002
-ExecStart=/usr/bin/qbittorrent-nox -d --webui-port=8080
-Restart=on-failure
+## 🛠️ Service Management (systemd)
 
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the service:
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable qbittorrent.service
-sudo systemctl start qbittorrent.service
+# Check status
+sudo systemctl status tc-media-player
+sudo systemctl status qbittorrent
+
+# Restart services
+sudo systemctl restart tc-media-player
+sudo systemctl restart qbittorrent
+
+# View live player logs
+journalctl -u tc-media-player -f
 ```
 
-## 2. Nginx Reverse Proxy
-To access the WebUI via Nginx, edit `/etc/nginx/sites-enabled/default` and restart the service:
-```bash
-sudo systemctl restart nginx
-```
+---
 
-## 3. MiniDLNA (ReadyDLNA) Setup
-
-### Installation
-```bash
-sudo apt install minidlna
-```
-
-### Configuration
-Edit `/etc/minidlna.conf` with the following settings:
-```conf
-# Media directory
-media_dir=/home/qbittorrent/Downloads
-
-# Database and logs
-db_dir=/var/cache/minidlna
-log_dir=/var/log/minidlna
-
-# Server name
-friendly_name=TC-Media
-
-# Auto-discovery
-inotify=yes
-```
-
-Restart the service to apply changes:
-```bash
-sudo systemctl restart minidlna
-```
+## 📄 License
+MIT License
