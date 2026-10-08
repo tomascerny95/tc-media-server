@@ -10,7 +10,7 @@ A lightweight, headless media server optimized for **Raspberry Pi** and Linux, r
 
 ## ⚡ Features
 - **Extremely Low Footprint**: Zero heavy database or indexing overhead (no DLNA/Plex/Jellyfin daemon bloat).
-- **Dedicated Player View**: Browse the library on the main page, choose subtitles, and open video in a clean fullscreen cinema player in a new tab.
+- **Dedicated Player View**: Browse the library on the main page, select subtitles, and open video in a clean fullscreen cinema player in a new tab.
 - **HTTP 206 Partial Content**: Smooth scrubbing and seeking support directly in the browser HTML5 player.
 - **On-the-Fly Subtitle Parsing**: Automatically discovers `.srt` and `.vtt` subtitles, converting SRT to WebVTT dynamically.
 - **In-Place Git Execution**: Runs straight from the cloned Git directory—seamless updates via `git pull`.
@@ -37,10 +37,34 @@ sudo bash ./setup_tc_media.sh
 | Service | Address | Description |
 |---|---|---|
 | **Web Video Player** | `http://<RPI_IP>:5000` | Browse media catalog & play videos |
-| **qBittorrent WebUI** | `http://<RPI_IP>:8080` | Manage torrent downloads (Passwordless setup) |
+| **qBittorrent WebUI** | `http://<RPI_IP>:8080` | Manage torrent downloads |
 
-> **Post-Installation Step:**  
-> Open the qBittorrent WebUI (`http://<RPI_IP>:8080`), navigate to **Tools ➔ Options ➔ Downloads**, and ensure the **Default Save Path** is set to `/dlna`.
+---
+
+## ⚙️ Essential Post-Installation Settings (qBittorrent)
+
+Open the qBittorrent WebUI at `http://<RPI_IP>:8080` and configure the following:
+
+### 1. Storage Location
+Navigate to **Tools ➔ Options ➔ Downloads**:
+- Set **Default Save Path** to `/dlna`.
+
+### 2. Tailscale & Domain Access (.local / .ts.net)
+To access qBittorrent seamlessly without password prompts or domain blocking when using **mDNS (`.local`)** or **Tailscale (`.ts.net`)**, go to **Tools ➔ Options ➔ Web UI**:
+
+- ✅ Check: **Bypass authentication for clients on localhost**
+- ✅ Check: **Bypass authentication for clients in whitelisted subnets**
+- In the IP subnet box, enter:
+```text
+0.0.0.0/0
+::/0
+```
+- Under **Security**, uncheck the following options:
+  - ❌ Uncheck: **Enable Host header validation** *(prevents domain-blocking on .local and Tailscale)*
+  - ❌ Uncheck: **Enable Cross-Site Request Forgery (CSRF) protection**
+  - ❌ Uncheck: **Enable clickjacking protection**
+
+Click **Save** at the bottom.
 
 ---
 
@@ -56,44 +80,41 @@ git fetch origin && git reset --hard origin/main && chmod +x setup_tc_media.sh &
 
 ---
 
-## 🛠️ Troubleshooting Common Update Issues
+## 🛠️ Troubleshooting Common Issues
 
-### 1. `error: Your local changes would be overwritten by merge (Aborting)`
+### 1. qBittorrent asks for password on `tc-media.local` or Tailscale
+- **Cause:** Domain access and Tailscale resolve to **IPv6** addresses. If only IPv4 was whitelisted, or if Host header validation is active, qBittorrent blocks access or prompts for credentials.
+- **Fix:** In **Tools ➔ Options ➔ Web UI**, ensure `::/0` is added to the subnet whitelist and **Enable Host header validation** is unchecked.
+
+---
+
+### 2. `error: Your local changes would be overwritten by merge (Aborting)`
 - **Cause:** Local file modifications or permission adjustments conflict with remote commits.
 - **Fix:** Discard local changes and force-sync with the remote repository:
-  ```bash
-  git fetch origin
-  git reset --hard origin/main
-  ```
+```bash
+git fetch origin
+git reset --hard origin/main
+```
 
 ---
 
-### 2. `sudo: ./setup_tc_media.sh: command not found`
+### 3. `sudo: ./setup_tc_media.sh: command not found`
 - **Cause:** The script lost its execution bit (`+x`) during Git reset, or contains Windows CRLF line endings (`\r`).
 - **Fix:** Remove carriage returns, re-apply execute permissions, and run via Bash:
-  ```bash
-  sed -i 's/\r$//' setup_tc_media.sh
-  chmod +x setup_tc_media.sh
-  sudo bash ./setup_tc_media.sh
-  ```
+```bash
+sed -i 's/\r$//' setup_tc_media.sh
+chmod +x setup_tc_media.sh
+sudo bash ./setup_tc_media.sh
+```
 
 ---
 
-### 3. `./setup_tc_media.sh: Bad substitution` or `[: Illegal number:`
+### 4. `./setup_tc_media.sh: Bad substitution` or `[: Illegal number:`
 - **Cause:** The script was executed with `sh` (`sh ./setup_tc_media.sh`). In Debian/Raspberry Pi OS, `/bin/sh` points to `dash`, which lacks Bash syntax support.
 - **Fix:** Always execute using `bash`:
-  ```bash
-  sudo bash ./setup_tc_media.sh
-  ```
-
----
-
-### 4. `Unable to lock /var/lib/apt/lists/lock (Permission denied)`
-- **Cause:** The installer was run without `sudo` privileges. Package management (`apt`) requires root access.
-- **Fix:** Prepend `sudo` to the command:
-  ```bash
-  sudo bash ./setup_tc_media.sh
-  ```
+```bash
+sudo bash ./setup_tc_media.sh
+```
 
 ---
 
