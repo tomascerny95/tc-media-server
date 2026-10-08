@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-TC-Media Server - Lightweight web video player in pure Python.
-Features:
-- Pure Python standard library (no external dependencies)
-- HTTP 206 Range requests (smooth video scrubbing/seeking)
-- Automatic subtitle discovery (.srt / .vtt) with dynamic SRT-to-WebVTT conversion
-- Memory-efficient 64 KB chunk streaming for 32-bit Raspberry Pi
+TC-Media Server - Lightweight web video library & player.
+- Main page: Catalog of videos with subtitle selection & "Open in New Tab" buttons.
+- Player page (/player): Dedicated cinema-style player opening in a new tab.
+- HTTP 206 Range requests (RFC 7233) for timeline seeking.
+- Automatic SRT to WebVTT conversion on the fly.
 """
 import os
 import sys
@@ -18,12 +17,11 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 # --- CONFIGURATION ---
 HOST = "0.0.0.0"
 PORT = 5000
-# Default directory is /dlna, can be overridden via command-line argument: python3 server.py /path/to/media
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
-CHUNK_SIZE = 64 * 1024  # 64 KB buffer size (low RAM footprint)
+CHUNK_SIZE = 64 * 1024  # 64 KB memory-friendly streaming chunks
 
 mimetypes.init()
 mimetypes.add_type("video/mp4", ".mp4")
@@ -32,19 +30,20 @@ mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
 mimetypes.add_type("text/vtt", ".vtt")
 
-# --- EMBEDDED WEB INTERFACE (HTML / CSS / JS) ---
-HTML_TEMPLATE = """<!DOCTYPE html>
+# --- HTML 1: MEDIA CATALOG (LIST OF VIDEOS) ---
+CATALOG_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TC-Media Player</title>
+    <title>TC-Media Library</title>
     <style>
         :root {
             --bg-main: #0f1115;
             --bg-card: #181b22;
             --bg-hover: #222630;
             --accent: #3b82f6;
+            --accent-hover: #2563eb;
             --text-main: #f3f4f6;
             --text-muted: #9ca3af;
             --border: #2e3440;
@@ -55,268 +54,325 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             background-color: var(--bg-main);
             color: var(--text-main);
             min-height: 100vh;
+            padding: 25px 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
             display: flex;
             flex-direction: column;
+            gap: 20px;
         }
         header {
-            background-color: var(--bg-card);
-            padding: 15px 25px;
-            border-bottom: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }
-        header h1 { font-size: 1.2rem; font-weight: 600; }
-        .dir-badge { font-size: 0.8rem; color: var(--text-muted); }
-        .container {
-            display: grid;
-            grid-template-columns: 360px 1fr;
-            flex: 1;
-            height: calc(100vh - 60px);
-        }
-        @media (max-width: 900px) {
-            .container { grid-template-columns: 1fr; height: auto; }
-        }
-        .sidebar {
-            background-color: var(--bg-card);
-            border-right: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-        .search-box {
-            padding: 15px;
             border-bottom: 1px solid var(--border);
+            padding-bottom: 15px;
         }
+        header h1 { font-size: 1.5rem; font-weight: 600; }
+        .badge { font-size: 0.85rem; color: var(--text-muted); }
         .search-box input {
             width: 100%;
-            background: var(--bg-main);
-            border: 1px solid var(--border);
-            color: var(--text-main);
-            padding: 10px 12px;
-            border-radius: 6px;
-            outline: none;
-        }
-        .search-box input:focus { border-color: var(--accent); }
-        .video-list {
-            list-style: none;
-            overflow-y: auto;
-            flex: 1;
-        }
-        .video-item {
-            padding: 12px 15px;
-            cursor: pointer;
-            border-bottom: 1px solid var(--border);
-            transition: background 0.15s;
-        }
-        .video-item:hover { background-color: var(--bg-hover); }
-        .video-item.active { background-color: var(--bg-hover); border-left: 4px solid var(--accent); }
-        .video-item .title { font-size: 0.95rem; font-weight: 500; word-break: break-all; }
-        .video-item .subtext { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
-        .player-area {
-            display: flex;
-            flex-direction: column;
-            padding: 25px;
-            overflow-y: auto;
-            gap: 20px;
-        }
-        .video-container {
-            width: 100%;
-            max-width: 1100px;
-            background: #000;
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-        }
-        video {
-            width: 100%;
-            max-height: 72vh;
-            display: block;
-            outline: none;
-        }
-        video::cue {
-            background-color: rgba(0, 0, 0, 0.8);
-            color: #ffffff;
-            font-size: 1.15rem;
-        }
-        .controls-card {
-            max-width: 1100px;
             background: var(--bg-card);
             border: 1px solid var(--border);
+            color: var(--text-main);
+            padding: 12px 16px;
             border-radius: 8px;
-            padding: 20px;
+            outline: none;
+            font-size: 0.95rem;
+        }
+        .search-box input:focus { border-color: var(--accent); }
+        .video-grid {
             display: flex;
             flex-direction: column;
+            gap: 12px;
+        }
+        .video-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             gap: 15px;
+            transition: border-color 0.15s, background-color 0.15s;
         }
-        .control-group {
+        .video-card:hover {
+            border-color: var(--accent);
+            background-color: var(--bg-hover);
+        }
+        .video-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .video-title {
+            font-size: 1.05rem;
+            font-weight: 600;
+            word-break: break-all;
+            margin-bottom: 4px;
+        }
+        .video-dir {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+        .video-actions {
             display: flex;
-            flex-direction: column;
-            gap: 6px;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
         }
-        label { font-size: 0.85rem; color: var(--text-muted); font-weight: 500; }
         select {
             background: var(--bg-main);
             color: var(--text-main);
             border: 1px solid var(--border);
-            padding: 10px;
+            padding: 8px 12px;
             border-radius: 6px;
             outline: none;
             cursor: pointer;
+            font-size: 0.85rem;
+            max-width: 250px;
         }
         select:focus { border-color: var(--accent); }
-        .empty-placeholder {
-            margin: auto;
-            color: var(--text-muted);
+        .btn-open {
+            background-color: var(--accent);
+            color: #ffffff;
+            text-decoration: none;
+            padding: 9px 18px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: background 0.15s;
+            white-space: nowrap;
+        }
+        .btn-open:hover { background-color: var(--accent-hover); }
+        .empty-state {
             text-align: center;
+            color: var(--text-muted);
+            padding: 40px 0;
+        }
+        @media (max-width: 768px) {
+            .video-card {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .video-actions {
+                width: 100%;
+                justify-content: space-between;
+            }
+            select { flex: 1; }
         }
     </style>
 </head>
 <body>
-    <header>
-        <h1>TC-Media Player</h1>
-        <span class="dir-badge">Media Directory: __MEDIA_DIR__</span>
-    </header>
-
     <div class="container">
-        <aside class="sidebar">
-            <div class="search-box">
-                <input type="text" id="searchInput" placeholder="Search videos...">
-            </div>
-            <ul class="video-list" id="videoList"></ul>
-        </aside>
+        <header>
+            <h1>TC-Media Library</h1>
+            <span class="badge">Directory: __MEDIA_DIR__</span>
+        </header>
 
-        <main class="player-area">
-            <div class="video-container" id="videoWrapper" style="display: none;">
-                <video id="player" controls playsinline></video>
-            </div>
+        <div class="search-box">
+            <input type="text" id="searchInput" placeholder="Search videos...">
+        </div>
 
-            <div class="controls-card" id="controlsCard" style="display: none;">
-                <h2 id="currentVideoTitle" style="font-size: 1.1rem; word-break: break-all;"></h2>
-                <div class="control-group">
-                    <label for="subSelect">Subtitles (auto-detected or select manually):</label>
-                    <select id="subSelect">
-                        <option value="">-- No Subtitles --</option>
-                    </select>
-                </div>
-            </div>
-
-            <div class="empty-placeholder" id="placeholder">
-                <p>Select a video from the list on the left to start playback.</p>
-            </div>
-        </main>
+        <div class="video-grid" id="videoGrid">
+            <div class="empty-state">Loading library...</div>
+        </div>
     </div>
 
     <script>
         let mediaData = { videos: [], subtitles: [] };
-        const player = document.getElementById('player');
-        const videoWrapper = document.getElementById('videoWrapper');
-        const controlsCard = document.getElementById('controlsCard');
-        const placeholder = document.getElementById('placeholder');
-        const videoList = document.getElementById('videoList');
-        const searchInput = document.getElementById('searchInput');
-        const subSelect = document.getElementById('subSelect');
-        const currentVideoTitle = document.getElementById('currentVideoTitle');
 
         async function init() {
             try {
                 const res = await fetch('/api/media');
                 mediaData = await res.json();
-                renderVideoList(mediaData.videos);
-                populateSubtitles(mediaData.subtitles);
+                renderVideos(mediaData.videos);
             } catch (err) {
-                console.error("Failed to load media list:", err);
+                console.error("Failed to load media:", err);
+                document.getElementById('videoGrid').innerHTML = '<div class="empty-state">Error loading media.</div>';
             }
         }
 
-        function renderVideoList(videos) {
-            videoList.innerHTML = '';
+        function renderVideos(videos) {
+            const container = document.getElementById('videoGrid');
+            if (videos.length === 0) {
+                container.innerHTML = '<div class="empty-state">No video files found in __MEDIA_DIR__.</div>';
+                return;
+            }
+            container.innerHTML = '';
+
             videos.forEach(v => {
-                const li = document.createElement('li');
-                li.className = 'video-item';
-                li.innerHTML = `
-                    <div class="title">${v.name}</div>
-                    <div class="subtext">${v.dir || '.'}</div>
+                const card = document.createElement('div');
+                card.className = 'video-card';
+
+                // Find auto-matching subtitle by basename
+                const vBase = v.name.substring(0, v.name.lastIndexOf('.')).toLowerCase() || v.name.toLowerCase();
+                const matchedSub = mediaData.subtitles.find(s => {
+                    const sBase = s.name.substring(0, s.name.lastIndexOf('.')).toLowerCase() || s.name.toLowerCase();
+                    return sBase === vBase;
+                });
+
+                // Build subtitle selector options
+                let optionsHtml = '<option value="">-- No Subtitles --</option>';
+                mediaData.subtitles.forEach(s => {
+                    const isSelected = matchedSub && matchedSub.path === s.path ? 'selected' : '';
+                    optionsHtml += `<option value="${encodeURIComponent(s.path)}" ${isSelected}>${s.name} (${s.dir || '.'})</option>`;
+                });
+
+                const initialSub = matchedSub ? encodeURIComponent(matchedSub.path) : '';
+                const initialUrl = `/player?video=${encodeURIComponent(v.path)}${initialSub ? '&sub=' + initialSub : ''}`;
+
+                card.innerHTML = `
+                    <div class="video-info">
+                        <div class="video-title">${v.name}</div>
+                        <div class="video-dir">${v.dir ? v.dir + ' • ' : ''}Video</div>
+                    </div>
+                    <div class="video-actions">
+                        <select class="sub-picker" title="Select subtitles">
+                            ${optionsHtml}
+                        </select>
+                        <a href="${initialUrl}" target="_blank" class="btn-open">
+                            <span>Open in New Tab &#8599;</span>
+                        </a>
+                    </div>
                 `;
-                li.onclick = () => playVideo(v, li);
-                videoList.appendChild(li);
+
+                // Update link when subtitle selection changes
+                const selectEl = card.querySelector('.sub-picker');
+                const linkEl = card.querySelector('.btn-open');
+                selectEl.addEventListener('change', () => {
+                    const chosenSub = selectEl.value;
+                    linkEl.href = `/player?video=${encodeURIComponent(v.path)}${chosenSub ? '&sub=' + chosenSub : ''}`;
+                });
+
+                container.appendChild(card);
             });
         }
 
-        function populateSubtitles(subs) {
-            subSelect.innerHTML = '<option value="">-- No Subtitles --</option>';
-            subs.forEach(s => {
-                const opt = document.createElement('option');
-                opt.value = s.path;
-                opt.textContent = `${s.name} (${s.dir || '.'})`;
-                subSelect.appendChild(opt);
-            });
-        }
-
-        function playVideo(video, element) {
-            document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
-            if (element) element.classList.add('active');
-
-            placeholder.style.display = 'none';
-            videoWrapper.style.display = 'block';
-            controlsCard.style.display = 'flex';
-            currentVideoTitle.textContent = video.name;
-
-            while (player.firstChild) {
-                player.removeChild(player.firstChild);
-            }
-
-            player.src = '/stream?path=' + encodeURIComponent(video.path);
-
-            // Auto-detect matching subtitle by basename
-            const videoBase = video.name.substring(0, video.name.lastIndexOf('.')) || video.name;
-            const matchedSub = mediaData.subtitles.find(s => {
-                const subBase = s.name.substring(0, s.name.lastIndexOf('.')) || s.name;
-                return subBase.toLowerCase() === videoBase.toLowerCase();
-            });
-
-            if (matchedSub) {
-                subSelect.value = matchedSub.path;
-                attachSubtitle(matchedSub.path);
-            } else {
-                subSelect.value = "";
-            }
-
-            player.load();
-            player.play().catch(() => {});
-        }
-
-        function attachSubtitle(subPath) {
-            const oldTrack = player.querySelector('track');
-            if (oldTrack) oldTrack.remove();
-            if (!subPath) return;
-
-            const track = document.createElement('track');
-            track.kind = 'subtitles';
-            track.label = 'Subtitles';
-            track.srclang = 'en';
-            track.src = '/subtitle?path=' + encodeURIComponent(subPath);
-            track.default = true;
-            player.appendChild(track);
-
-            setTimeout(() => {
-                if (player.textTracks && player.textTracks[0]) {
-                    player.textTracks[0].mode = 'showing';
-                }
-            }, 100);
-        }
-
-        subSelect.addEventListener('change', (e) => attachSubtitle(e.target.value));
-
-        searchInput.addEventListener('input', (e) => {
+        document.getElementById('searchInput').addEventListener('input', (e) => {
             const q = e.target.value.toLowerCase();
             const filtered = mediaData.videos.filter(v =>
                 v.name.toLowerCase().includes(q) || (v.dir && v.dir.toLowerCase().includes(q))
             );
-            renderVideoList(filtered);
+            renderVideos(filtered);
         });
 
         init();
+    </script>
+</body>
+</html>
+"""
+
+# --- HTML 2: DEDICATED CINEMA-STYLE PLAYER (OPENS IN NEW TAB) ---
+PLAYER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Playback</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: #000000;
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .player-bar {
+            background-color: rgba(15, 17, 21, 0.9);
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.9rem;
+            z-index: 10;
+        }
+        .video-title {
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 75vw;
+        }
+        .close-hint {
+            color: #9ca3af;
+            text-decoration: none;
+            font-size: 0.85rem;
+        }
+        .close-hint:hover { color: #ffffff; }
+        .video-wrapper {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #000;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            max-height: calc(100vh - 45px);
+            outline: none;
+        }
+        video::cue {
+            background-color: rgba(0, 0, 0, 0.8);
+            color: #ffffff;
+            font-size: 1.25rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="player-bar">
+        <span class="video-title" id="titleDisplay">Loading video...</span>
+        <a href="javascript:window.close()" class="close-hint">&#10005; Close Tab</a>
+    </div>
+
+    <div class="video-wrapper">
+        <video id="player" controls autoplay playsinline></video>
+    </div>
+
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const videoPath = params.get('video');
+        const subPath = params.get('sub');
+
+        const player = document.getElementById('player');
+        const titleDisplay = document.getElementById('titleDisplay');
+
+        if (!videoPath) {
+            titleDisplay.textContent = "Error: No video specified.";
+        } else {
+            const fileName = decodeURIComponent(videoPath).split('/').pop().split('\\\\').pop();
+            document.title = fileName + " - TC-Media";
+            titleDisplay.textContent = fileName;
+
+            player.src = '/stream?path=' + encodeURIComponent(videoPath);
+
+            if (subPath) {
+                const track = document.createElement('track');
+                track.kind = 'subtitles';
+                track.label = 'Subtitles';
+                track.srclang = 'en';
+                track.src = '/subtitle?path=' + encodeURIComponent(subPath);
+                track.default = true;
+                player.appendChild(track);
+
+                setTimeout(() => {
+                    if (player.textTracks && player.textTracks[0]) {
+                        player.textTracks[0].mode = 'showing';
+                    }
+                }, 150);
+            }
+
+            player.play().catch(() => {});
+        }
     </script>
 </body>
 </html>
@@ -332,10 +388,10 @@ def convert_srt_to_vtt(srt_text: str) -> str:
 class MediaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
-        pass  # Quiet logging to save disk I/O on Raspberry Pi
+        pass  # Quiet logging for performance
 
     def is_safe_path(self, rel_path: str) -> bool:
-        """Prevent Directory Traversal attacks (../)."""
+        """Prevent Directory Traversal attacks."""
         abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
         return os.path.commonpath([MEDIA_DIR, abs_path]) == MEDIA_DIR and os.path.exists(abs_path)
 
@@ -344,9 +400,9 @@ class MediaHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # 1. Main web interface
+        # 1. Main Media Catalog
         if path in ("/", "/index.html"):
-            html = HTML_TEMPLATE.replace("__MEDIA_DIR__", MEDIA_DIR)
+            html = CATALOG_HTML.replace("__MEDIA_DIR__", MEDIA_DIR)
             content = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -355,7 +411,17 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        # 2. API media list (JSON)
+        # 2. Dedicated Video Player Page (New Tab)
+        elif path == "/player":
+            content = PLAYER_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        # 3. JSON API with media & subtitle files
         elif path == "/api/media":
             videos = []
             subtitles = []
@@ -384,11 +450,11 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        # 3. Subtitles serving with dynamic SRT to WebVTT conversion
+        # 4. Subtitle serving with SRT -> WebVTT conversion
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Subtitle file not found")
+                self.send_error(404, "Subtitle not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -415,14 +481,14 @@ class MediaHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(encoded)
             except Exception as e:
-                self.send_error(500, f"Error processing subtitles: {e}")
+                self.send_error(500, f"Error: {e}")
             return
 
-        # 4. Video streaming with HTTP 206 Partial Content (Range requests)
+        # 5. Video streaming with HTTP 206 Range requests
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Video file not found")
+                self.send_error(404, "Video not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -433,11 +499,10 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
 
     def handle_range_streaming(self, file_path: str):
-        """Implements RFC 7233 Range requests for timeline scrubbing."""
         try:
             file_size = os.path.getsize(file_path)
         except OSError:
-            self.send_error(404, "Video file not found")
+            self.send_error(404, "Video not found")
             return
 
         mime_type, _ = mimetypes.guess_type(file_path)
@@ -446,7 +511,7 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         range_header = self.headers.get("Range")
 
-        # No Range header -> send entire file (HTTP 200)
+        # No Range requested -> send full file
         if not range_header:
             self.send_response(200)
             self.send_header("Content-Type", mime_type)
@@ -462,10 +527,9 @@ class MediaHandler(BaseHTTPRequestHandler):
                 pass
             return
 
-        # Parse Range: bytes=start-end
         range_match = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
         if not range_match:
-            self.send_response(416)  # Range Not Satisfiable
+            self.send_response(416)
             self.send_header("Content-Range", f"bytes */{file_size}")
             self.end_headers()
             return
@@ -485,14 +549,13 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         content_length = (end - start) + 1
 
-        self.send_response(206)  # Partial Content
+        self.send_response(206)
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Content-Length", str(content_length))
         self.send_header("Accept-Ranges", "bytes")
         self.end_headers()
 
-        # Stream requested byte chunk
         try:
             with open(file_path, "rb") as f:
                 f.seek(start)
