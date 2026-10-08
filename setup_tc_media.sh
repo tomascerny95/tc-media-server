@@ -22,36 +22,52 @@ if [ -z "$TARGET_USER" ]; then
   exit 1
 fi
 
+echo "=========================================================="
+echo "  TC-Media Server Setup & Auto-Updater"
+echo "  Running in-place from : $REPO_DIR"
+echo "  Target User           : $TARGET_USER"
+echo "=========================================================="
+
+echo "=== [1/6] Stopping existing services (Safe Update) ==="
+# Stop services before updating code to prevent race conditions or locked files
+if systemctl is-active --quiet tc-media-player.service 2>/dev/null; then
+    echo "-> Stopping tc-media-player.service..."
+    systemctl stop tc-media-player.service
+fi
+
+if systemctl is-active --quiet qbittorrent.service 2>/dev/null; then
+    echo "-> Stopping qbittorrent.service..."
+    systemctl stop qbittorrent.service
+fi
+
+echo "=== [2/6] Pulling latest code from Git ==="
+# If inside a Git repository, automatically pull updates under TARGET_USER
+if [ -d "$REPO_DIR/.git" ]; then
+    echo "-> Checking for updates on GitHub..."
+    sudo -u "$TARGET_USER" git -C "$REPO_DIR" pull || echo "-> Note: Local changes present or already up to date."
+fi
+
 # Verify server.py is present in the repository
 if [ ! -f "$REPO_DIR/server.py" ]; then
   echo "[!] Error: server.py not found in $REPO_DIR!"
   exit 1
 fi
 
-echo "=========================================================="
-echo "  TC-Media Server Setup"
-echo "  Running in-place from : $REPO_DIR"
-echo "  Target User           : $TARGET_USER"
-echo "=========================================================="
-
-echo "=== [1/5] Installing system packages ==="
+echo "=== [3/6] Installing & verifying system packages ==="
 apt update
 apt install -y qbittorrent-nox python3
 
-echo "=== [2/5] Configuring directory permissions ==="
-# Setup /dlna shared storage
+echo "=== [4/6] Configuring directory permissions ==="
 mkdir -p "$MEDIA_DIR"
 chown -R "${TARGET_USER}:${TARGET_USER}" "$MEDIA_DIR"
 chmod -R 775 "$MEDIA_DIR"
 
-# Ensure repo files are executable and owned by the user
 chmod +x "$REPO_DIR/server.py"
 chown -R "${TARGET_USER}:${TARGET_USER}" "$REPO_DIR"
 
-echo "=== [3/5] Pre-configuring qBittorrent (Passwordless WebUI) ==="
+echo "=== [5/6] Pre-configuring qBittorrent (Passwordless WebUI) ==="
 mkdir -p "$QBIT_CONF_DIR"
 
-# Inject WebUI bypass so you are never locked out of port 8080
 CONF_PATH="$QBIT_CONF_FILE" python3 - << 'EOF'
 import os
 
@@ -61,7 +77,6 @@ os.makedirs(os.path.dirname(conf_path), exist_ok=True)
 lines = []
 if os.path.exists(conf_path):
     with open(conf_path, 'r', encoding='utf-8', errors='ignore') as f:
-        # Strip out old passwords, bans, and whitelist entries
         lines = [l for l in f if not any(k in l for k in [
             'WebUI\\AuthSubnetWhitelist',
             'WebUI\\Password',
@@ -69,11 +84,9 @@ if os.path.exists(conf_path):
             'WebUI\\MaxAuthFailCount'
         ])]
 
-# Ensure [Preferences] section exists
 if not any('[Preferences]' in l for l in lines):
     lines.append('\n[Preferences]\n')
 
-# Inject authentication whitelist bypass and unban
 out = []
 for line in lines:
     out.append(line)
@@ -88,9 +101,9 @@ EOF
 
 chown -R "${TARGET_USER}:${TARGET_USER}" "$QBIT_CONF_DIR"
 
-echo "=== [4/5] Configuring systemd services ==="
+echo "=== [6/6] Starting services back up ==="
 
-# 1. qBittorrent service
+# 1. qBittorrent service unit
 cat << EOF > /etc/systemd/system/qbittorrent.service
 [Unit]
 Description=BitTorrent Client Daemon ($TARGET_USER)
@@ -108,7 +121,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 2. TC-Media Video Player service (runs directly from the Git directory)
+# 2. TC-Media Video Player service unit
 cat << EOF > /etc/systemd/system/tc-media-player.service
 [Unit]
 Description=TC Media Web Video Player ($TARGET_USER)
@@ -129,7 +142,6 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-echo "=== [5/5] Enabling and starting services ==="
 systemctl daemon-reload
 systemctl enable qbittorrent.service
 systemctl enable tc-media-player.service
@@ -141,13 +153,8 @@ IP_ADDR=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo "=========================================================="
-echo " Setup complete! Running in-place from: $REPO_DIR"
+echo " Update complete! Both services are back ONLINE."
 echo "=========================================================="
 echo " 1. Web Video Player : http://${IP_ADDR}:5000"
-echo "    -> Streaming from: $MEDIA_DIR"
-echo ""
 echo " 2. qBittorrent WebUI: http://${IP_ADDR}:8080"
-echo "    -> Status        : Logged in automatically (No password required)"
-echo "    -> Remember to   : Set Default Save Path to $MEDIA_DIR"
-echo "                       (Options -> Downloads -> Default Save Path)"
 echo "=========================================================="
