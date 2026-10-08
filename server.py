@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+TC-Media Server - Lightweight web video player in pure Python.
+Features:
+- Pure Python standard library (no external dependencies)
+- HTTP 206 Range requests (smooth video scrubbing/seeking)
+- Automatic subtitle discovery (.srt / .vtt) with dynamic SRT-to-WebVTT conversion
+- Memory-efficient 64 KB chunk streaming for 32-bit Raspberry Pi
+"""
 import os
 import sys
 import re
@@ -7,16 +15,15 @@ import mimetypes
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-# --- KONFIGURACE ---
+# --- CONFIGURATION ---
 HOST = "0.0.0.0"
 PORT = 5000
-# Výchozí složka, lze přepsat prvním argumentem z příkazové řádky: python3 server.py /cesta/k/videim
+# Default directory is /dlna, can be overridden via command-line argument: python3 server.py /path/to/media
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
-
-CHUNK_SIZE = 64 * 1024  # 64 KB bloky pro streamování (nízké nároky na RAM)
+CHUNK_SIZE = 64 * 1024  # 64 KB buffer size (low RAM footprint)
 
 mimetypes.init()
 mimetypes.add_type("video/mp4", ".mp4")
@@ -25,20 +32,19 @@ mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
 mimetypes.add_type("text/vtt", ".vtt")
 
-# --- HTML/CSS/JS ŠABLONA ---
+# --- EMBEDDED WEB INTERFACE (HTML / CSS / JS) ---
 HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RPi Media Player</title>
+    <title>TC-Media Player</title>
     <style>
         :root {
             --bg-main: #0f1115;
             --bg-card: #181b22;
             --bg-hover: #222630;
             --accent: #3b82f6;
-            --accent-hover: #60a5fa;
             --text-main: #f3f4f6;
             --text-muted: #9ca3af;
             --border: #2e3440;
@@ -60,17 +66,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             justify-content: space-between;
             align-items: center;
         }
-        header h1 { font-size: 1.25rem; font-weight: 600; }
+        header h1 { font-size: 1.2rem; font-weight: 600; }
+        .dir-badge { font-size: 0.8rem; color: var(--text-muted); }
         .container {
             display: grid;
-            grid-template-columns: 350px 1fr;
+            grid-template-columns: 360px 1fr;
             flex: 1;
-            height: calc(100vh - 65px);
+            height: calc(100vh - 60px);
         }
         @media (max-width: 900px) {
             .container { grid-template-columns: 1fr; height: auto; }
         }
-        /* Levý panel - seznam */
         .sidebar {
             background-color: var(--bg-card);
             border-right: 1px solid var(--border);
@@ -107,19 +113,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .video-item.active { background-color: var(--bg-hover); border-left: 4px solid var(--accent); }
         .video-item .title { font-size: 0.95rem; font-weight: 500; word-break: break-all; }
         .video-item .subtext { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
-
-        /* Pravý panel - přehrávač */
         .player-area {
             display: flex;
             flex-direction: column;
             padding: 25px;
             overflow-y: auto;
-            background: var(--bg-main);
             gap: 20px;
         }
         .video-container {
             width: 100%;
-            max-width: 1000px;
+            max-width: 1100px;
             background: #000;
             border-radius: 8px;
             overflow: hidden;
@@ -127,18 +130,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         video {
             width: 100%;
-            max-height: 70vh;
+            max-height: 72vh;
             display: block;
             outline: none;
         }
-        /* Styl titulků */
         video::cue {
-            background-color: rgba(0, 0, 0, 0.75);
+            background-color: rgba(0, 0, 0, 0.8);
             color: #ffffff;
-            font-size: 1.1rem;
+            font-size: 1.15rem;
         }
         .controls-card {
-            max-width: 1000px;
+            max-width: 1100px;
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 8px;
@@ -172,14 +174,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
     <header>
-        <h1>RPi Web Video Player</h1>
-        <span style="font-size: 0.85rem; color: var(--text-muted);">Složka: __MEDIA_DIR__</span>
+        <h1>TC-Media Player</h1>
+        <span class="dir-badge">Media Directory: __MEDIA_DIR__</span>
     </header>
 
     <div class="container">
         <aside class="sidebar">
             <div class="search-box">
-                <input type="text" id="searchInput" placeholder="Hledat video...">
+                <input type="text" id="searchInput" placeholder="Search videos...">
             </div>
             <ul class="video-list" id="videoList"></ul>
         </aside>
@@ -192,23 +194,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="controls-card" id="controlsCard" style="display: none;">
                 <h2 id="currentVideoTitle" style="font-size: 1.1rem; word-break: break-all;"></h2>
                 <div class="control-group">
-                    <label for="subSelect">Titulky (detekované i globální):</label>
+                    <label for="subSelect">Subtitles (auto-detected or select manually):</label>
                     <select id="subSelect">
-                        <option value="">-- Bez titulků --</option>
+                        <option value="">-- No Subtitles --</option>
                     </select>
                 </div>
             </div>
 
             <div class="empty-placeholder" id="placeholder">
-                <p>Vyberte video ze seznamu vlevo pro spuštění přehrávání.</p>
+                <p>Select a video from the list on the left to start playback.</p>
             </div>
         </main>
     </div>
 
     <script>
         let mediaData = { videos: [], subtitles: [] };
-        let activeVideo = null;
-
         const player = document.getElementById('player');
         const videoWrapper = document.getElementById('videoWrapper');
         const controlsCard = document.getElementById('controlsCard');
@@ -225,7 +225,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 renderVideoList(mediaData.videos);
                 populateSubtitles(mediaData.subtitles);
             } catch (err) {
-                console.error("Chyba načítání médií:", err);
+                console.error("Failed to load media list:", err);
             }
         }
 
@@ -244,7 +244,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         function populateSubtitles(subs) {
-            subSelect.innerHTML = '<option value="">-- Bez titulků --</option>';
+            subSelect.innerHTML = '<option value="">-- No Subtitles --</option>';
             subs.forEach(s => {
                 const opt = document.createElement('option');
                 opt.value = s.path;
@@ -257,25 +257,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
             if (element) element.classList.add('active');
 
-            activeVideo = video;
             placeholder.style.display = 'none';
             videoWrapper.style.display = 'block';
             controlsCard.style.display = 'flex';
             currentVideoTitle.textContent = video.name;
 
-            // Vyčistit staré titulkové stopy
             while (player.firstChild) {
                 player.removeChild(player.firstChild);
             }
 
-            // Nastavit zdroj videa pro streamování s podporou Range
             player.src = '/stream?path=' + encodeURIComponent(video.path);
 
-            // Pokus o automatickou detekci titulků (shodný název souboru bez přípony)
-            const videoBaseName = video.name.substring(0, video.name.lastIndexOf('.')) || video.name;
+            // Auto-detect matching subtitle by basename
+            const videoBase = video.name.substring(0, video.name.lastIndexOf('.')) || video.name;
             const matchedSub = mediaData.subtitles.find(s => {
-                const subBaseName = s.name.substring(0, s.name.lastIndexOf('.')) || s.name;
-                return subBaseName.toLowerCase() === videoBaseName.toLowerCase();
+                const subBase = s.name.substring(0, s.name.lastIndexOf('.')) || s.name;
+                return subBase.toLowerCase() === videoBase.toLowerCase();
             });
 
             if (matchedSub) {
@@ -290,22 +287,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         function attachSubtitle(subPath) {
-            // Odstranit existující <track>
             const oldTrack = player.querySelector('track');
             if (oldTrack) oldTrack.remove();
-
             if (!subPath) return;
 
             const track = document.createElement('track');
             track.kind = 'subtitles';
-            track.label = 'Titulky';
-            track.srclang = 'cs';
-            // Titulky se načtou přes handler /subtitle (i .srt se vrátí jako WebVTT)
+            track.label = 'Subtitles';
+            track.srclang = 'en';
             track.src = '/subtitle?path=' + encodeURIComponent(subPath);
             track.default = true;
             player.appendChild(track);
 
-            // Aktivovat stopu v textTracks
             setTimeout(() => {
                 if (player.textTracks && player.textTracks[0]) {
                     player.textTracks[0].mode = 'showing';
@@ -313,14 +306,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }, 100);
         }
 
-        subSelect.addEventListener('change', (e) => {
-            attachSubtitle(e.target.value);
-        });
+        subSelect.addEventListener('change', (e) => attachSubtitle(e.target.value));
 
         searchInput.addEventListener('input', (e) => {
-            const query = e.target.value.toLowerCase();
-            const filtered = mediaData.videos.filter(v => 
-                v.name.toLowerCase().includes(query) || (v.dir && v.dir.toLowerCase().includes(query))
+            const q = e.target.value.toLowerCase();
+            const filtered = mediaData.videos.filter(v =>
+                v.name.toLowerCase().includes(q) || (v.dir && v.dir.toLowerCase().includes(q))
             );
             renderVideoList(filtered);
         });
@@ -331,27 +322,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-# --- POMOCNÉ FUNKCE PRO TITULKY ---
 def convert_srt_to_vtt(srt_text: str) -> str:
-    """Převádí SRT časové značky (00:00:00,000) na WebVTT (00:00:00.000)."""
+    """Converts SRT timestamp format (00:00:00,000) to WebVTT format (00:00:00.000)."""
     vtt = "WEBVTT\n\n"
-    # Náhrada čárky za tečku v časových indexech SRT
     converted = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', srt_text)
     return vtt + converted
 
 
-# --- HTTP REQUEST HANDLER ---
 class MediaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
-        # Tiché logování (odkomentujte pro detailní ladění)
-        pass
-
-    def send_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        pass  # Quiet logging to save disk I/O on Raspberry Pi
 
     def is_safe_path(self, rel_path: str) -> bool:
-        """Ochrana proti Path Traversal útoku (../)."""
+        """Prevent Directory Traversal attacks (../)."""
         abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
         return os.path.commonpath([MEDIA_DIR, abs_path]) == MEDIA_DIR and os.path.exists(abs_path)
 
@@ -360,8 +344,8 @@ class MediaHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # 1. Hlavní rozhraní
-        if path == "/" or path == "/index.html":
+        # 1. Main web interface
+        if path in ("/", "/index.html"):
             html = HTML_TEMPLATE.replace("__MEDIA_DIR__", MEDIA_DIR)
             content = html.encode("utf-8")
             self.send_response(200)
@@ -371,7 +355,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        # 2. API pro seznam médií (JSON)
+        # 2. API media list (JSON)
         elif path == "/api/media":
             videos = []
             subtitles = []
@@ -385,12 +369,7 @@ class MediaHandler(BaseHTTPRequestHandler):
                     if rel_dir == ".":
                         rel_dir = ""
 
-                    item = {
-                        "name": f,
-                        "path": rel_path,
-                        "dir": rel_dir
-                    }
-
+                    item = {"name": f, "path": rel_path, "dir": rel_dir}
                     if ext in VIDEO_EXTENSIONS:
                         videos.append(item)
                     elif ext in SUBTITLE_EXTENSIONS:
@@ -399,24 +378,23 @@ class MediaHandler(BaseHTTPRequestHandler):
             data = json.dumps({"videos": videos, "subtitles": subtitles}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(data)))
-            self.send_cors_headers()
             self.end_headers()
             self.wfile.write(data)
             return
 
-        # 3. Načtení titulků (s konverzí SRT -> VTT)
+        # 3. Subtitles serving with dynamic SRT to WebVTT conversion
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Soubor nenalezen")
+                self.send_error(404, "Subtitle file not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
             ext = os.path.splitext(full_path)[1].lower()
 
             try:
-                # Otevření se záložním kódováním
                 try:
                     with open(full_path, "r", encoding="utf-8") as f:
                         raw = f.read()
@@ -432,19 +410,19 @@ class MediaHandler(BaseHTTPRequestHandler):
                 encoded = vtt_content.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/vtt; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Content-Length", str(len(encoded)))
-                self.send_cors_headers()
                 self.end_headers()
                 self.wfile.write(encoded)
             except Exception as e:
-                self.send_error(500, f"Chyba při zpracování titulků: {e}")
+                self.send_error(500, f"Error processing subtitles: {e}")
             return
 
-        # 4. Streamování videa s podporou HTTP Range (RFC 7233)
+        # 4. Video streaming with HTTP 206 Partial Content (Range requests)
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Soubor nenalezen")
+                self.send_error(404, "Video file not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -452,14 +430,14 @@ class MediaHandler(BaseHTTPRequestHandler):
             return
 
         else:
-            self.send_error(404, "Nenalezeno")
+            self.send_error(404, "Not Found")
 
     def handle_range_streaming(self, file_path: str):
-        """Implementace HTTP 206 Partial Content pro přeskakování v čase."""
+        """Implements RFC 7233 Range requests for timeline scrubbing."""
         try:
             file_size = os.path.getsize(file_path)
         except OSError:
-            self.send_error(404, "Soubor nenalezen")
+            self.send_error(404, "Video file not found")
             return
 
         mime_type, _ = mimetypes.guess_type(file_path)
@@ -468,7 +446,7 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         range_header = self.headers.get("Range")
 
-        # Bez Range hlavičky -> pošle se celý soubor (HTTP 200)
+        # No Range header -> send entire file (HTTP 200)
         if not range_header:
             self.send_response(200)
             self.send_header("Content-Type", mime_type)
@@ -484,7 +462,7 @@ class MediaHandler(BaseHTTPRequestHandler):
                 pass
             return
 
-        # Zpracování Range: bytes=start-end
+        # Parse Range: bytes=start-end
         range_match = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
         if not range_match:
             self.send_response(416)  # Range Not Satisfiable
@@ -514,7 +492,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.end_headers()
 
-        # Posílání požadovaného rozsahu po blocích
+        # Stream requested byte chunk
         try:
             with open(file_path, "rb") as f:
                 f.seek(start)
@@ -531,19 +509,15 @@ class MediaHandler(BaseHTTPRequestHandler):
 
 
 def run_server():
-    if not os.path.exists(MEDIA_DIR):
-        print(f"Varování: Složka {MEDIA_DIR} neexistuje! Bude vytvořena...")
-        os.makedirs(MEDIA_DIR, exist_ok=True)
-
-    print(f"=== RPi Web Video Player ===")
-    print(f"Kořenová složka médií: {MEDIA_DIR}")
-    print(f"Běží na: http://{HOST}:{PORT}")
-
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    print(f"=== TC-Media Server ===")
+    print(f"Media Directory : {MEDIA_DIR}")
+    print(f"Server Running  : http://{HOST}:{PORT}")
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nUkončuji server...")
+        print("\nStopping server...")
         server.server_close()
 
 
