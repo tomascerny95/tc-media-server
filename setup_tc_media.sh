@@ -1,33 +1,62 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
 
-# Kontrola root prav
+# Resolve absolute path to the git repository directory
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEDIA_DIR="/dlna"
+
+# Ensure root privileges
 if [ "$EUID" -ne 0 ]; then
-  echo "Prosím, spusťte tento skript jako root (použijte sudo)."
-  exit
+  echo "[!] Please run this script with root privileges: sudo ./setup_tc_media.sh"
+  exit 1
 fi
 
-echo "--- Zahajuji instalaci TC-Media Serveru ---"
+# Fully automatic detection of the regular user (UID >= 1000)
+TARGET_USER="${SUDO_USER:-$(awk -F: '$3 >= 1000 && $3 < 60000 {print $1; exit}' /etc/passwd)}"
 
-# 1. Instalace balíčků
-apt update && apt install -y qbittorrent-nox minidlna
-
-# 2. Nastavení uživatele
-if ! id "qbittorrent" &>/dev/null; then
-    useradd -r -m qbittorrent
-    echo "Uživatel qbittorrent vytvořen."
+if [ -z "$TARGET_USER" ]; then
+  echo "[!] Error: Failed to detect a valid system user!"
+  exit 1
 fi
-usermod -a -G qbittorrent $SUDO_USER
 
-# 3. Vytvoření systemd služby pro qBittorrent
-cat > /etc/systemd/system/qbittorrent.service <<EOF
+# Verify server.py presence in the repository
+if [ ! -f "$REPO_DIR/server.py" ]; then
+  echo "[!] Error: server.py not found in $REPO_DIR!"
+  exit 1
+fi
+
+echo "=========================================================="
+echo "  TC-Media Server Setup"
+echo "  Running in-place from : $REPO_DIR"
+echo "  Target User           : $TARGET_USER"
+echo "=========================================================="
+
+echo "=== [1/4] Installing system packages ==="
+apt update
+apt install -y qbittorrent-nox python3
+
+echo "=== [2/4] Configuring directories and permissions ==="
+# Prepare /dlna shared media directory
+mkdir -p "$MEDIA_DIR"
+chown -R "${TARGET_USER}:${TARGET_USER}" "$MEDIA_DIR"
+chmod -R 775 "$MEDIA_DIR"
+
+# Ensure repo files are executable and owned by the user (allows git pull without sudo)
+chmod +x "$REPO_DIR/server.py"
+chown -R "${TARGET_USER}:${TARGET_USER}" "$REPO_DIR"
+
+echo "=== [3/4] Configuring systemd services (in-place from Git) ==="
+
+# 1. qBittorrent daemon service
+cat << EOF > /etc/systemd/system/qbittorrent.service
 [Unit]
-Description=BitTorrent Client
+Description=BitTorrent Client Daemon ($TARGET_USER)
 After=network.target
 
 [Service]
 Type=forking
-User=qbittorrent
-Group=qbittorrent
+User=$TARGET_USER
+Group=$TARGET_USER
 UMask=002
 ExecStart=/usr/bin/qbittorrent-nox -d --webui-port=8080
 Restart=on-failure
@@ -36,26 +65,45 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 4. Konfigurace MiniDLNA
-cp /etc/minidlna.conf /etc/minidlna.conf.bak
-cat > /etc/minidlna.conf <<EOF
-media_dir=/home/qbittorrent/Downloads
-db_dir=/var/cache/minidlna
-log_dir=/var/log/minidlna
-friendly_name=TC-Media
-inotify=yes
+# 2. TC-Media Video Player service (runs directly from the Git repository)
+cat << EOF > /etc/systemd/system/tc-media-player.service
+[Unit]
+Description=TC Media Web Video Player ($TARGET_USER)
+After=network.target
+
+[Service]
+Type=simple
+User=$TARGET_USER
+Group=$TARGET_USER
+WorkingDirectory=$REPO_DIR
+ExecStart=/usr/bin/python3 $REPO_DIR/server.py $MEDIA_DIR
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-# Nastavení oprávnění pro složku stahování
-mkdir -p /home/qbittorrent/Downloads
-chown -R qbittorrent:qbittorrent /home/qbittorrent/Downloads
-chmod -R 775 /home/qbittorrent/Downloads
-
-# 5. Spuštění služeb
+echo "=== [4/4] Enabling and starting services ==="
 systemctl daemon-reload
-systemctl enable qbittorrent.service minidlna
-systemctl restart qbittorrent.service minidlna
+systemctl enable qbittorrent.service
+systemctl enable tc-media-player.service
 
-echo "--- Instalace hotova! ---"
-echo "WebUI qBittorrent běží na portu 8080."
-echo "MiniDLNA (TC-Media) je aktivní."
+systemctl restart qbittorrent.service
+systemctl restart tc-media-player.service
+
+IP_ADDR=$(hostname -I | awk '{print $1}')
+
+echo ""
+echo "=========================================================="
+echo " Setup complete! Running in-place from: $REPO_DIR"
+echo "=========================================================="
+echo " 1. Web Video Player : http://${IP_ADDR}:5000"
+echo "    -> Watching dir  : $MEDIA_DIR"
+echo ""
+echo " 2. qBittorrent WebUI: http://${IP_ADDR}:8080"
+echo "    -> Set Default Save Path to: $MEDIA_DIR"
+echo "       (Options -> Downloads -> Default Save Path)"
+echo "=========================================================="
