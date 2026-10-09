@@ -2,7 +2,7 @@
 """
 TC-Media Server - Custom Televize Library & Video.js 7 Player.
 - Library page: Faithful implementation of the Televize card grid & infinite scroll.
-- Player page: Exact Video.js 7.10.2 setup with Hotkeys, Mobile-UI & Resolution switcher.
+- Player page: Robust Video.js 7 setup with Hotkeys, Mobile-UI & dynamic subtitles.
 - HTTP 206 Range streaming & automatic SRT to WebVTT conversion.
 """
 import os
@@ -356,7 +356,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
 </html>
 """
 
-# --- 2. ŠABLONA PŘEHRÁVAČE (VIDEO.JS 7.10.2 + PLUGINS) ---
+# --- 2. ŠABLONA PŘEHRÁVAČE (VIDEO.JS + HOTKEYS + MOBILE-UI) ---
 PLAYER_HTML = """<!DOCTYPE html>
 <html lang="cs">
 <head>
@@ -369,13 +369,10 @@ PLAYER_HTML = """<!DOCTYPE html>
             background-color: black;
             color: #f0f0f0;
             margin: 0;
-            padding: 1px 0;
+            padding: 0;
             display: flex;
             flex-direction: column;
-            justify-content: center;
-            align-items: center;
             min-height: 100vh;
-            box-sizing: border-box;
             overflow: hidden;
         }
         .player-header {
@@ -414,9 +411,9 @@ PLAYER_HTML = """<!DOCTYPE html>
             display: flex;
             justify-content: center;
             align-items: center;
+            background: #000;
         }
-        #videoPlayer {
-            margin: 0;
+        .video-js {
             width: 100% !important;
             height: 100% !important;
         }
@@ -427,20 +424,27 @@ PLAYER_HTML = """<!DOCTYPE html>
             width: 70px !important;
             height: 70px !important;
             line-height: 70px !important;
+            top: 50% !important;
+            left: 50% !important;
+            transform: translate(-50%, -50%) !important;
         }
         .video-js .vjs-play-progress {
             background-color: #e54c4c !important;
         }
+        video::cue {
+            background-color: rgba(0, 0, 0, 0.8) !important;
+            color: #ffffff !important;
+            font-size: 1.25rem !important;
+        }
     </style>
 
-    <link rel="stylesheet" href="https://unpkg.com/video.js@7.10.2/dist/video-js.min.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-resolution-switcher-vjs7@1.0.0/videojs-resolution-switcher.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-mobile-ui/dist/videojs-mobile-ui.css" />
+    <!-- Stabilní oficiální CDN knihovny Video.js a pluginů -->
+    <link rel="stylesheet" href="https://vjs.zencdn.net/7.20.3/video-js.min.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-mobile-ui@0.7.0/dist/videojs-mobile-ui.css" />
 
-    <script src="https://unpkg.com/video.js@7.10.2/dist/video.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/videojs-resolution-switcher-vjs7@1.0.0/videojs-resolution-switcher.js"></script>
-    <script src="https://cdn.sc.gl/videojs-hotkeys/latest/videojs.hotkeys.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/videojs-mobile-ui/dist/videojs-mobile-ui.min.js"></script>
+    <script src="https://vjs.zencdn.net/7.20.3/video.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/videojs-hotkeys@0.2.28/videojs.hotkeys.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/videojs-mobile-ui@0.7.0/dist/videojs-mobile-ui.min.js"></script>
 </head>
 <body>
     <div class="player-header">
@@ -449,9 +453,9 @@ PLAYER_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="video-box">
-        <video id="videoPlayer" class="video-js vjs-big-play-centered" playsinline preload="auto">
+        <video id="videoPlayer" class="video-js vjs-default-skin vjs-big-play-centered" controls playsinline preload="auto">
             <p class="vjs-no-js">
-                Chcete-li zobrazit toto video, povolte JavaScript a použijte prohlížeč podporující HTML5 video.
+                Pro zobrazení videa povolte JavaScript a použijte prohlížeč podporující HTML5 video.
             </p>
         </video>
     </div>
@@ -469,42 +473,49 @@ PLAYER_HTML = """<!DOCTYPE html>
             document.title = fileName + ' - Televize';
             heading.textContent = fileName;
 
+            var ext = fileName.split('.').pop().toLowerCase();
+            var mimeType = 'video/mp4';
+            if (ext === 'webm') mimeType = 'video/webm';
+            else if (ext === 'mkv') mimeType = 'video/x-matroska';
+
             var player = videojs('videoPlayer', {
-                "controls": true,
-                "autoplay": true,
-                plugins: {
-                    videoJsResolutionSwitcher: {},
-                    hotkeys: {},
-                    mobileUi: {
-                        fullscreen: {
-                            enterOnRotate: true,
-                            exitOnRotate: true,
-                            lockOnRotate: false,
-                            lockToLandscapeOnEnter: false,
-                            iOS: false,
-                            disabled: false
-                        },
-                        touchControls: {
-                            seekSeconds: 10,
-                            tapTimeout: 300,
-                            disableOnEnd: false,
-                            disabled: false
-                        }
-                    }
-                }
-            }, function() {
-                var p = this;
+                controls: true,
+                autoplay: true,
+                sources: [{
+                    src: '/stream?path=' + encodeURIComponent(videoPath),
+                    type: mimeType
+                }]
+            });
 
-                p.updateSrc([
-                    {
-                        src: '/stream?path=' + encodeURIComponent(videoPath),
-                        type: 'video/mp4',
-                        label: 'Originál'
-                    }
-                ]);
+            // Aktivace klávesových zkratek (Hotkeys)
+            if (typeof player.hotkeys === 'function') {
+                player.hotkeys({
+                    volumeStep: 0.1,
+                    seekStep: 5,
+                    enableModifiersForNumbers: false
+                });
+            }
 
-                if (subPath) {
-                    p.addRemoteTextTrack({
+            // Aktivace mobilních gest (Mobile-UI)
+            if (typeof player.mobileUi === 'function') {
+                player.mobileUi({
+                    fullscreen: {
+                        enterOnRotate: true,
+                        exitOnRotate: true,
+                        lockOnRotate: false,
+                        iOS: false
+                    },
+                    touchControls: {
+                        seekSeconds: 10,
+                        tapTimeout: 300
+                    }
+                });
+            }
+
+            // Připojení vybraných titulků
+            if (subPath) {
+                player.ready(function() {
+                    player.addRemoteTextTrack({
                         kind: 'captions',
                         srclang: 'cs',
                         label: 'Titulky: cze',
@@ -513,13 +524,13 @@ PLAYER_HTML = """<!DOCTYPE html>
                     }, false);
 
                     setTimeout(function() {
-                        var tracks = p.textTracks();
+                        var tracks = player.textTracks();
                         if (tracks && tracks[0]) {
                             tracks[0].mode = 'showing';
                         }
-                    }, 250);
-                }
-            });
+                    }, 300);
+                });
+            }
         }
     </script>
 </body>
