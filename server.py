@@ -29,7 +29,6 @@ mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
 mimetypes.add_type("text/vtt", ".vtt")
 
-# SVG náhledová ikona pro videa (lehká, rychlá, nevyžaduje FFmpeg na Raspberry Pi)
 THUMBNAIL_SVG = urllib.parse.quote("""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 214 120" width="214" height="120">
   <rect width="214" height="120" fill="#14171d"/>
   <circle cx="107" cy="60" r="28" fill="#e54c4c" opacity="0.85"/>
@@ -434,12 +433,10 @@ PLAYER_HTML = """<!DOCTYPE html>
         }
     </style>
 
-    <!-- Video.js 7.10.2 & Plugins Stylesheets -->
     <link rel="stylesheet" href="https://unpkg.com/video.js@7.10.2/dist/video-js.min.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-resolution-switcher-vjs7@1.0.0/videojs-resolution-switcher.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-mobile-ui/dist/videojs-mobile-ui.css" />
 
-    <!-- Video.js 7.10.2 & Plugins Scripts -->
     <script src="https://unpkg.com/video.js@7.10.2/dist/video.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/videojs-resolution-switcher-vjs7@1.0.0/videojs-resolution-switcher.js"></script>
     <script src="https://cdn.sc.gl/videojs-hotkeys/latest/videojs.hotkeys.min.js"></script>
@@ -454,8 +451,7 @@ PLAYER_HTML = """<!DOCTYPE html>
     <div class="video-box">
         <video id="videoPlayer" class="video-js vjs-big-play-centered" playsinline preload="auto">
             <p class="vjs-no-js">
-                Chcete-li zobrazit toto video, povolte JavaScript a zvažte upgrade na webový prohlížeč, který
-                <a href="https://videojs.com/html5-video-support/" target="_blank">podporuje HTML5 video</a>.
+                Chcete-li zobrazit toto video, povolte JavaScript a použijte prohlížeč podporující HTML5 video.
             </p>
         </video>
     </div>
@@ -469,7 +465,7 @@ PLAYER_HTML = """<!DOCTYPE html>
         if (!videoPath) {
             heading.textContent = 'Chyba: Nebylo specifikováno žádné video.';
         } else {
-            var fileName = decodeURIComponent(videoPath).split('/').pop().split('\\\\').pop();
+            var fileName = decodeURIComponent(videoPath).split('/').pop().split('\\').pop();
             document.title = fileName + ' - Televize';
             heading.textContent = fileName;
 
@@ -499,7 +495,6 @@ PLAYER_HTML = """<!DOCTYPE html>
             }, function() {
                 var p = this;
 
-                // Nastavení zdroje přes resolution switcher
                 p.updateSrc([
                     {
                         src: '/stream?path=' + encodeURIComponent(videoPath),
@@ -508,7 +503,6 @@ PLAYER_HTML = """<!DOCTYPE html>
                     }
                 ]);
 
-                // Připojení vybraných titulků
                 if (subPath) {
                     p.addRemoteTextTrack({
                         kind: 'captions',
@@ -533,7 +527,6 @@ PLAYER_HTML = """<!DOCTYPE html>
 """
 
 def convert_srt_to_vtt(srt_text: str) -> str:
-    """Konverze SRT časových značek do WebVTT formátu."""
     vtt = "WEBVTT\n\n"
     converted = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', srt_text)
     return vtt + converted
@@ -553,7 +546,6 @@ class MediaHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # 1. Hlavní katalog knihovny Televize
         if path in ("/", "/index.html"):
             html = LIBRARY_HTML.replace("__MEDIA_DIR__", MEDIA_DIR)
             content = html.encode("utf-8")
@@ -564,7 +556,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        # 2. Přehrávač Video.js (v nové kartě)
         elif path == "/player":
             content = PLAYER_HTML.encode("utf-8")
             self.send_response(200)
@@ -574,7 +565,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        # 3. API pro stránkování a vyhledávání videí (pro nekonečný scroll)
         elif path in ("/api/videos", "/api/media"):
             all_videos = []
             all_subtitles = []
@@ -594,7 +584,6 @@ class MediaHandler(BaseHTTPRequestHandler):
                     elif ext in SUBTITLE_EXTENSIONS:
                         all_subtitles.append(item)
 
-            # Filtrování podle dotazu 'q'
             search_query = query.get("q", [""])[0].lower().strip()
             if search_query:
                 filtered_videos = [
@@ -604,7 +593,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             else:
                 filtered_videos = all_videos
 
-            # Stránkování (page, limit)
             try:
                 page = int(query.get("page", ["1"])[0])
                 limit = int(query.get("limit", ["20"])[0])
@@ -615,12 +603,10 @@ class MediaHandler(BaseHTTPRequestHandler):
             end_idx = start_idx + limit
             paged_videos = filtered_videos[start_idx:end_idx]
 
-            # Příprava položek s titulkami
             response_items = []
             for v in paged_videos:
                 v_base = os.path.splitext(v["name"])[0].lower()
 
-                # Hledání shodných titulků
                 matched_sub = None
                 available_subs = []
                 for s in all_subtitles:
@@ -652,7 +638,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        # 4. Streamování titulků s dynamickou konverzí do WebVTT
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
@@ -686,4 +671,103 @@ class MediaHandler(BaseHTTPRequestHandler):
                 self.send_error(500, f"Chyba: {e}")
             return
 
-        # 5. Streamování videa s podporou HTTP 206 Range
+        elif path == "/stream":
+            rel_path = query.get("path", [""])[0]
+            if not self.is_safe_path(rel_path):
+                self.send_error(404, "Video nenalezeno")
+                return
+
+            full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
+            self.handle_range_streaming(full_path)
+            return
+
+        else:
+            self.send_error(404, "Nenalezeno")
+
+    def handle_range_streaming(self, file_path: str):
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            self.send_error(404, "Video nenalezeno")
+            return
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            mime_type = "video/mp4"
+
+        range_header = self.headers.get("Range")
+
+        if not range_header:
+            self.send_response(200)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+
+            try:
+                with open(file_path, "rb") as f:
+                    while chunk := f.read(CHUNK_SIZE):
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        range_match = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
+        if not range_match:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{file_size}")
+            self.end_headers()
+            return
+
+        start_str, end_str = range_match.groups()
+        start = int(start_str) if start_str else 0
+        end = int(end_str) if end_str else file_size - 1
+
+        if start >= file_size or start > end:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{file_size}")
+            self.end_headers()
+            return
+
+        if end >= file_size:
+            end = file_size - 1
+
+        content_length = (end - start) + 1
+
+        self.send_response(206)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+
+        try:
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                bytes_left = content_length
+                while bytes_left > 0:
+                    read_bytes = min(CHUNK_SIZE, bytes_left)
+                    chunk = f.read(read_bytes)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    bytes_left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+def run_server():
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    print(f"=== Televize Media Server ===")
+    print(f"Složka médií : {MEDIA_DIR}")
+    print(f"Server běží na : http://{HOST}:{PORT}")
+    server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nUkončuji server...")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    run_server()
