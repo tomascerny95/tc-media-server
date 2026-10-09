@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-TC-Media Server - Custom Library & Video.js Player.
-- Main page: Card-based library matching custom Televize theme (#1e242c / #e54c4c).
-- Player page (/player): Video.js cinema player with Hotkeys, Mobile gestures, and auto-subtitles.
-- HTTP 206 Range requests (RFC 7233) for timeline seeking.
-- Automatic SRT to WebVTT conversion on the fly.
+TC-Media Server - Custom Televize Library & Video.js 7 Player.
+- Library page: Faithful implementation of the Televize card grid & infinite scroll.
+- Player page: Exact Video.js 7.10.2 setup with Hotkeys, Mobile-UI & Resolution switcher.
+- HTTP 206 Range streaming & automatic SRT to WebVTT conversion.
 """
 import os
 import sys
@@ -21,7 +20,7 @@ MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
-CHUNK_SIZE = 64 * 1024  # 64 KB memory-friendly streaming chunks
+CHUNK_SIZE = 64 * 1024
 
 mimetypes.init()
 mimetypes.add_type("video/mp4", ".mp4")
@@ -30,22 +29,28 @@ mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
 mimetypes.add_type("text/vtt", ".vtt")
 
-# --- HTML 1: CUSTOM CARD-BASED MEDIA LIBRARY ---
-CATALOG_HTML = """<!DOCTYPE html>
-<html lang="en">
+# SVG náhledová ikona pro videa (lehká, rychlá, nevyžaduje FFmpeg na Raspberry Pi)
+THUMBNAIL_SVG = urllib.parse.quote("""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 214 120" width="214" height="120">
+  <rect width="214" height="120" fill="#14171d"/>
+  <circle cx="107" cy="60" r="28" fill="#e54c4c" opacity="0.85"/>
+  <polygon points="101,46 120,60 101,74" fill="#ffffff"/>
+</svg>""")
+DEFAULT_THUMBNAIL = f"data:image/svg+xml;utf8,{THUMBNAIL_SVG}"
+
+# --- 1. ŠABLONA KNIHOVNY (TELEVIZE) ---
+LIBRARY_HTML = """<!DOCTYPE html>
+<html lang="cs">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TC-Media Library</title>
+    <title>Televize</title>
     <style>
-        * { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             background-color: #1e242c;
             color: #f0f0f0;
             margin: 0;
             padding: 20px 0;
-            min-height: 100vh;
         }
         .container {
             width: 90%;
@@ -60,37 +65,25 @@ CATALOG_HTML = """<!DOCTYPE html>
             text-align: center;
             color: #ffffff;
             margin-top: 10px;
-            margin-bottom: 25px;
-            font-size: 2.6rem;
+            margin-bottom: 35px;
+            font-size: 2.8rem;
             font-weight: 700;
-            letter-spacing: -0.5px;
-        }
-        .sub-header {
-            text-align: center;
-            color: #999999;
-            font-size: 0.9rem;
-            margin-bottom: 30px;
         }
         .url-form {
             display: flex;
             justify-content: center;
-            margin-bottom: 35px;
+            margin-bottom: 50px;
             gap: 10px;
         }
         .url-form input[type="text"] {
             width: 100%;
-            max-width: 480px;
+            max-width: 450px;
             padding: 12px 18px;
             border: 1px solid #3a414c;
             border-radius: 6px;
             font-size: 1rem;
             background-color: #1e242c;
             color: #f0f0f0;
-            outline: none;
-            transition: border-color 0.2s;
-        }
-        .url-form input[type="text"]:focus {
-            border-color: #e54c4c;
         }
         .url-form input[type="text"]::placeholder {
             color: #999999;
@@ -111,64 +104,36 @@ CATALOG_HTML = """<!DOCTYPE html>
         }
         .video-list {
             text-align: center;
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            gap: 20px;
         }
         .video-item {
             display: inline-flex;
             flex-direction: column;
-            width: 240px;
-            min-height: 290px;
+            vertical-align: top;
+            width: 214px;
+            min-height: 275px;
+            margin: 15px;
             text-align: left;
-            background-color: #1e242c;
+            background-color: #2a313c;
             border: 1px solid #3a414c;
             border-radius: 8px;
             overflow: hidden;
-            transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
-        }
-        .video-item:hover {
-            transform: translateY(-3px);
-            border-color: #e54c4c;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+            box-sizing: border-box;
         }
         .video-thumbnail {
             width: 100%;
-            height: 130px;
-            background: linear-gradient(135deg, #14171d, #252b36);
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            text-decoration: none;
-            color: #f0f0f0;
+            height: 120px;
+            background-color: #1c1e21;
+            display: block;
+            flex-shrink: 0;
             position: relative;
-            cursor: pointer;
         }
-        .video-thumbnail svg {
-            width: 44px;
-            height: 44px;
-            fill: #e54c4c;
-            transition: transform 0.2s;
-        }
-        .video-item:hover .video-thumbnail svg {
-            transform: scale(1.15);
-        }
-        .video-badge {
-            position: absolute;
-            bottom: 8px;
-            right: 8px;
-            background-color: rgba(0, 0, 0, 0.7);
-            font-size: 0.7rem;
-            font-weight: 600;
-            padding: 2px 6px;
-            border-radius: 4px;
-            color: #e54c4c;
-            text-transform: uppercase;
+        .video-thumbnail img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
         }
         .video-details {
-            padding: 12px 14px;
+            padding: 12px;
             flex-grow: 1;
             display: flex;
             flex-direction: column;
@@ -179,43 +144,29 @@ CATALOG_HTML = """<!DOCTYPE html>
             color: inherit;
         }
         .video-title-link:hover p {
-            color: #e54c4c;
+            text-decoration: underline;
         }
         .video-details p {
-            margin: 0 0 8px 0;
-            font-weight: 600;
+            margin: 0 0 10px 0;
+            font-weight: 500;
             font-size: 0.95rem;
             word-break: break-all;
             display: -webkit-box;
             -webkit-line-clamp: 2;
             -webkit-box-orient: vertical;
             overflow: hidden;
-            line-height: 1.35;
         }
-        .video-dir-hint {
-            font-size: 0.75rem;
-            color: #888888;
-            margin-bottom: 10px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .sub-select-wrapper {
-            margin-bottom: 12px;
-        }
-        .sub-select-wrapper select {
+        .sub-select {
             width: 100%;
-            background-color: #2a313c;
-            border: 1px solid #3a414c;
+            background-color: #1e242c;
             color: #f0f0f0;
-            padding: 6px 8px;
+            border: 1px solid #3a414c;
             border-radius: 4px;
-            font-size: 0.8rem;
+            padding: 5px;
+            font-size: 0.75rem;
+            margin-bottom: 10px;
             outline: none;
             cursor: pointer;
-        }
-        .sub-select-wrapper select:focus {
-            border-color: #e54c4c;
         }
         .video-links {
             padding-top: 10px;
@@ -223,224 +174,254 @@ CATALOG_HTML = """<!DOCTYPE html>
             text-align: center;
             margin-top: auto;
         }
-        .video-links .btn-play {
-            display: block;
-            width: 100%;
-            text-align: center;
-            text-decoration: none;
+        .video-links button {
             background-color: transparent;
             border: 1px solid #e54c4c;
             color: #e54c4c;
-            padding: 8px 14px;
+            padding: 6px 14px;
+            margin: 0 4px;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 0.85rem;
-            font-weight: 600;
+            font-size: 0.8rem;
+            font-weight: 500;
             transition: background-color 0.2s, color 0.2s;
         }
-        .video-links .btn-play:hover {
+        .video-links button:hover {
             background-color: #e54c4c;
             color: #ffffff;
         }
         .load-more-container {
             text-align: center;
             margin-top: 40px;
-            padding-bottom: 10px;
+            padding-bottom: 20px;
+            height: 50px;
         }
         .loading-indicator {
+            display: none;
+            text-align: center;
+            font-size: 1.1em;
             color: #999999;
-            font-size: 1.1rem;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Televize</h1>
-        <div class="sub-header">Media Directory: __MEDIA_DIR__</div>
-
-        <form class="url-form" onsubmit="event.preventDefault();">
-            <input type="text" id="searchInput" placeholder="Hledat video v knihovně...">
-            <button type="button" id="clearBtn">Vymazat</button>
+        <form class="url-form">
+            <input type="text" name="url_input" placeholder="Hledat video v knihovně...">
+            <button type="submit">Hledat</button>
         </form>
-
-        <div class="video-list" id="videoContainer"></div>
-
+        <div class="video-list"></div>
         <div class="load-more-container">
-            <div class="loading-indicator" id="loadingText">Načítám média...</div>
+            <div class="loading-indicator">Načítám...</div>
         </div>
     </div>
-
     <script>
-        let mediaData = { videos: [], subtitles: [] };
-        const videoContainer = document.getElementById('videoContainer');
-        const loadingText = document.getElementById('loadingText');
-        const searchInput = document.getElementById('searchInput');
-        const clearBtn = document.getElementById('clearBtn');
+        document.addEventListener('DOMContentLoaded', function() {
+            var videoListContainer = document.querySelector('.video-list');
+            var loadingIndicator = document.querySelector('.loading-indicator');
+            var urlForm = document.querySelector('.url-form');
+            var urlInput = document.querySelector('input[name="url_input"]');
+            var currentPage = 1, itemsPerPage = 20, isLoading = false, allDataLoaded = false;
+            var currentQuery = '';
 
-        async function init() {
-            try {
-                const res = await fetch('/api/media');
-                mediaData = await res.json();
-                renderVideos(mediaData.videos);
-            } catch (err) {
-                console.error("Error loading media:", err);
-                loadingText.textContent = "Chyba při načítání dat.";
+            function refreshVideoList() {
+                videoListContainer.innerHTML = '';
+                currentPage = 1;
+                allDataLoaded = false;
+                loadingIndicator.textContent = 'Načítám...';
+                fetchAndDisplayVideos();
             }
-        }
 
-        function renderVideos(videos) {
-            videoContainer.innerHTML = '';
-            if (videos.length === 0) {
-                loadingText.textContent = "Nenalezena žádná videa.";
-                return;
-            }
-            loadingText.textContent = `Zobrazeno ${videos.length} videí`;
-
-            videos.forEach(v => {
-                const item = document.createElement('div');
-                item.className = 'video-item';
-
-                const ext = v.name.split('.').pop() || 'video';
-                const vBase = v.name.substring(0, v.name.lastIndexOf('.')).toLowerCase() || v.name.toLowerCase();
-                const matchedSub = mediaData.subtitles.find(s => {
-                    const sBase = s.name.substring(0, s.name.lastIndexOf('.')).toLowerCase() || s.name.toLowerCase();
-                    return sBase === vBase;
-                });
-
-                let optionsHtml = '<option value="">-- Bez titulků --</option>';
-                mediaData.subtitles.forEach(s => {
-                    const isSelected = matchedSub && matchedSub.path === s.path ? 'selected' : '';
-                    optionsHtml += `<option value="${encodeURIComponent(s.path)}" ${isSelected}>${s.name}</option>`;
-                });
-
-                const initialSub = matchedSub ? encodeURIComponent(matchedSub.path) : '';
-                const initialUrl = `/player?video=${encodeURIComponent(v.path)}${initialSub ? '&sub=' + initialSub : ''}`;
-
-                item.innerHTML = `
-                    <a href="${initialUrl}" target="_blank" class="video-thumbnail" title="Spustit ${v.name}">
-                        <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                        <span class="video-badge">${ext}</span>
-                    </a>
-                    <div class="video-details">
-                        <div>
-                            <a href="${initialUrl}" target="_blank" class="video-title-link">
-                                <p title="${v.name}">${v.name}</p>
-                            </a>
-                            <div class="video-dir-hint" title="${v.dir || '.'}">${v.dir || 'Kořenová složka'}</div>
-                        </div>
-                        <div class="sub-select-wrapper">
-                            <select class="sub-picker" title="Vyberte titulky">
-                                ${optionsHtml}
-                            </select>
-                        </div>
-                        <div class="video-links">
-                            <a href="${initialUrl}" target="_blank" class="btn-play">Přehrát ↗</a>
-                        </div>
-                    </div>
-                `;
-
-                const selectEl = item.querySelector('.sub-picker');
-                const linkThumb = item.querySelector('.video-thumbnail');
-                const linkTitle = item.querySelector('.video-title-link');
-                const linkBtn = item.querySelector('.btn-play');
-
-                selectEl.addEventListener('change', () => {
-                    const chosen = selectEl.value;
-                    const updatedUrl = `/player?video=${encodeURIComponent(v.path)}${chosen ? '&sub=' + chosen : ''}`;
-                    linkThumb.href = updatedUrl;
-                    linkTitle.href = updatedUrl;
-                    linkBtn.href = updatedUrl;
-                });
-
-                videoContainer.appendChild(item);
+            urlForm.addEventListener('submit', function(event) {
+                event.preventDefault();
+                currentQuery = urlInput.value.trim();
+                refreshVideoList();
             });
-        }
 
-        searchInput.addEventListener('input', (e) => {
-            const query = e.target.value.toLowerCase().trim();
-            const filtered = mediaData.videos.filter(v =>
-                v.name.toLowerCase().includes(query) || (v.dir && v.dir.toLowerCase().includes(query))
-            );
-            renderVideos(filtered);
+            urlInput.addEventListener('input', function() {
+                if (urlInput.value.trim() === '' && currentQuery !== '') {
+                    currentQuery = '';
+                    refreshVideoList();
+                }
+            });
+
+            function displayVideos(videos) {
+                var fragment = document.createDocumentFragment();
+                videos.forEach(function(video) {
+                    var videoItem = document.createElement('div');
+                    videoItem.classList.add('video-item');
+
+                    var optionsHtml = '<option value="">-- Bez titulků --</option>';
+                    if (video.availableSubtitles) {
+                        video.availableSubtitles.forEach(function(sub) {
+                            var sel = sub.matched ? 'selected' : '';
+                            optionsHtml += '<option value="' + encodeURIComponent(sub.path) + '" ' + sel + '>' + sub.name + '</option>';
+                        });
+                    }
+
+                    var initialSub = video.matchedSub ? '&sub=' + encodeURIComponent(video.matchedSub) : '';
+                    var playUrl = '/player?video=' + encodeURIComponent(video.path) + initialSub;
+
+                    videoItem.innerHTML =
+                        '<a href="' + playUrl + '" target="_blank" class="thumb-link">' +
+                            '<div class="video-thumbnail">' +
+                                '<img src="' + video.thumbnail + '" alt="Náhled: ' + video.title + '" loading="lazy">' +
+                            '</div>' +
+                        '</a>' +
+                        '<div class="video-details">' +
+                            '<a href="' + playUrl + '" target="_blank" class="video-title-link title-link">' +
+                                '<p title="' + video.title + '">' + video.title + '</p>' +
+                            '</a>' +
+                            '<select class="sub-select" title="Vybrat titulky">' + optionsHtml + '</select>' +
+                            '<div class="video-links">' +
+                                '<button type="button" class="btn-open">Přehrát ↗</button>' +
+                            '</div>' +
+                        '</div>';
+
+                    var selectEl = videoItem.querySelector('.sub-select');
+                    var thumbLink = videoItem.querySelector('.thumb-link');
+                    var titleLink = videoItem.querySelector('.title-link');
+                    var btnOpen = videoItem.querySelector('.btn-open');
+
+                    function updateUrls() {
+                        var sub = selectEl.value;
+                        var newUrl = '/player?video=' + encodeURIComponent(video.path) + (sub ? '&sub=' + sub : '');
+                        thumbLink.href = newUrl;
+                        titleLink.href = newUrl;
+                        return newUrl;
+                    }
+
+                    selectEl.addEventListener('change', updateUrls);
+                    btnOpen.addEventListener('click', function() {
+                        window.open(updateUrls(), '_blank');
+                    });
+
+                    fragment.appendChild(videoItem);
+                });
+                videoListContainer.appendChild(fragment);
+            }
+
+            function resetLoadingState() {
+                isLoading = false;
+                if (!allDataLoaded) {
+                    loadingIndicator.style.display = 'none';
+                }
+            }
+
+            function fetchAndDisplayVideos() {
+                if (isLoading || allDataLoaded) return;
+                isLoading = true;
+                loadingIndicator.style.display = 'block';
+
+                var apiUrl = '/api/videos?page=' + currentPage + '&limit=' + itemsPerPage +
+                             (currentQuery ? '&q=' + encodeURIComponent(currentQuery) : '');
+
+                fetch(apiUrl)
+                    .then(function(response) {
+                        if (!response.ok) { throw new Error('Chyba sítě: ' + response.statusText); }
+                        return response.json();
+                    })
+                    .then(function(newVideos) {
+                        if (newVideos.length > 0) {
+                            displayVideos(newVideos);
+                            currentPage++;
+                        }
+                        if (newVideos.length < itemsPerPage) {
+                            allDataLoaded = true;
+                            loadingIndicator.textContent = newVideos.length === 0 && currentPage === 1 ?
+                                'Nenalezena žádná videa.' : 'Všechna videa načtena.';
+                        }
+                        resetLoadingState();
+                    })
+                    .catch(function(error) {
+                        console.error("Chyba při načítání videí:", error);
+                        allDataLoaded = true;
+                        loadingIndicator.textContent = 'Chyba při načítání dat.';
+                    });
+            }
+
+            function handleScroll() {
+                var scrollPosition = window.innerHeight + (window.scrollY || document.documentElement.scrollTop);
+                var totalHeight = document.documentElement.offsetHeight;
+                if (scrollPosition >= totalHeight - 300) {
+                    fetchAndDisplayVideos();
+                }
+            }
+
+            window.addEventListener('scroll', handleScroll);
+            refreshVideoList();
         });
-
-        clearBtn.addEventListener('click', () => {
-            searchInput.value = '';
-            renderVideos(mediaData.videos);
-        });
-
-        init();
     </script>
 </body>
 </html>
 """
 
-# --- HTML 2: VIDEO.JS CINEMA-STYLE PLAYER (OPENS IN NEW TAB) ---
+# --- 2. ŠABLONA PŘEHRÁVAČE (VIDEO.JS 7.10.2 + PLUGINS) ---
 PLAYER_HTML = """<!DOCTYPE html>
 <html lang="cs">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Přehrávání</title>
-
-    <!-- Video.js Base CSS -->
-    <link href="https://vjs.zencdn.net/7.20.3/video-js.min.css" rel="stylesheet" />
-    <!-- Video.js Mobile UI CSS -->
-    <link href="https://cdn.jsdelivr.net/npm/videojs-mobile-ui@0.7.0/dist/videojs-mobile-ui.css" rel="stylesheet" />
-
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            background-color: #000000;
-            color: #ffffff;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: black;
+            color: #f0f0f0;
+            margin: 0;
+            padding: 1px 0;
             display: flex;
             flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            box-sizing: border-box;
             overflow: hidden;
         }
-        .player-bar {
+        .player-header {
+            width: 100%;
             background-color: #1e242c;
             padding: 10px 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            font-size: 0.95rem;
-            z-index: 10;
+            box-sizing: border-box;
             border-bottom: 1px solid #3a414c;
+            z-index: 10;
         }
-        .video-title {
+        .player-title {
             font-weight: 600;
+            font-size: 1rem;
+            color: #ffffff;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
-            max-width: 75vw;
-            color: #ffffff;
+            max-width: 80vw;
         }
-        .close-hint {
+        .player-close {
             color: #e54c4c;
             text-decoration: none;
             font-size: 0.9rem;
-            font-weight: 500;
-            transition: color 0.15s;
+            font-weight: 600;
         }
-        .close-hint:hover { color: #ff7878; }
-        .video-wrapper {
+        .player-close:hover {
+            color: #ff6b6b;
+        }
+        .video-box {
             flex: 1;
-            position: relative;
-            background: #000000;
+            width: 100%;
+            height: calc(100vh - 45px);
             display: flex;
             justify-content: center;
             align-items: center;
         }
-        .video-js {
+        #videoPlayer {
+            margin: 0;
             width: 100% !important;
             height: 100% !important;
         }
-        .vjs-big-play-button {
-            top: 50% !important;
-            left: 50% !important;
-            transform: translate(-50%, -50%) !important;
+        .video-js .vjs-big-play-button {
             background-color: rgba(229, 76, 76, 0.85) !important;
             border-color: #e54c4c !important;
             border-radius: 50% !important;
@@ -451,65 +432,59 @@ PLAYER_HTML = """<!DOCTYPE html>
         .video-js .vjs-play-progress {
             background-color: #e54c4c !important;
         }
-        video::cue {
-            background-color: rgba(0, 0, 0, 0.8) !important;
-            color: #ffffff !important;
-            font-size: 1.25rem !important;
-        }
     </style>
+
+    <!-- Video.js 7.10.2 & Plugins Stylesheets -->
+    <link rel="stylesheet" href="https://unpkg.com/video.js@7.10.2/dist/video-js.min.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-resolution-switcher-vjs7@1.0.0/videojs-resolution-switcher.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-mobile-ui/dist/videojs-mobile-ui.css" />
+
+    <!-- Video.js 7.10.2 & Plugins Scripts -->
+    <script src="https://unpkg.com/video.js@7.10.2/dist/video.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/videojs-resolution-switcher-vjs7@1.0.0/videojs-resolution-switcher.js"></script>
+    <script src="https://cdn.sc.gl/videojs-hotkeys/latest/videojs.hotkeys.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/videojs-mobile-ui/dist/videojs-mobile-ui.min.js"></script>
 </head>
 <body>
-    <div class="player-bar">
-        <span class="video-title" id="titleDisplay">Načítám video...</span>
-        <a href="javascript:window.close()" class="close-hint">&#10005; Zavřít kartu</a>
+    <div class="player-header">
+        <span class="player-title" id="videoHeading">Načítám...</span>
+        <a href="javascript:window.close()" class="player-close">&#10005; Zavřít kartu</a>
     </div>
 
-    <div class="video-wrapper">
-        <video id="videoPlayer" class="video-js vjs-default-skin vjs-big-play-centered" controls playsinline preload="auto">
+    <div class="video-box">
+        <video id="videoPlayer" class="video-js vjs-big-play-centered" playsinline preload="auto">
             <p class="vjs-no-js">
-                Pro zobrazení videa povolte JavaScript a použijte prohlížeč podporující HTML5 video.
+                Chcete-li zobrazit toto video, povolte JavaScript a zvažte upgrade na webový prohlížeč, který
+                <a href="https://videojs.com/html5-video-support/" target="_blank">podporuje HTML5 video</a>.
             </p>
         </video>
     </div>
 
-    <!-- Video.js & Plugins -->
-    <script src="https://vjs.zencdn.net/7.20.3/video.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/videojs-hotkeys@0.2.28/videojs.hotkeys.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/videojs-mobile-ui@0.7.0/dist/videojs-mobile-ui.min.js"></script>
-
     <script>
-        const params = new URLSearchParams(window.location.search);
-        const videoPath = params.get('video');
-        const subPath = params.get('sub');
-        const titleDisplay = document.getElementById('titleDisplay');
+        var params = new URLSearchParams(window.location.search);
+        var videoPath = params.get('video');
+        var subPath = params.get('sub');
+        var heading = document.getElementById('videoHeading');
 
         if (!videoPath) {
-            titleDisplay.textContent = "Chyba: Nebylo vybráno žádné video.";
+            heading.textContent = 'Chyba: Nebylo specifikováno žádné video.';
         } else {
-            const fileName = decodeURIComponent(videoPath).split('/').pop().split('\\\\').pop();
-            document.title = fileName + " - Televize";
-            titleDisplay.textContent = fileName;
+            var fileName = decodeURIComponent(videoPath).split('/').pop().split('\\\\').pop();
+            document.title = fileName + ' - Televize';
+            heading.textContent = fileName;
 
-            const player = videojs('videoPlayer', {
-                autoplay: true,
-                controls: true,
-                responsive: true,
-                fluid: false,
-                sources: [{
-                    src: '/stream?path=' + encodeURIComponent(videoPath),
-                    type: 'video/mp4'
-                }],
+            var player = videojs('videoPlayer', {
+                "controls": true,
+                "autoplay": true,
                 plugins: {
-                    hotkeys: {
-                        volumeStep: 0.1,
-                        seekStep: 5,
-                        enableModifiersForNumbers: false
-                    },
+                    videoJsResolutionSwitcher: {},
+                    hotkeys: {},
                     mobileUi: {
                         fullscreen: {
                             enterOnRotate: true,
                             exitOnRotate: true,
                             lockOnRotate: false,
+                            lockToLandscapeOnEnter: false,
                             iOS: false,
                             disabled: false
                         },
@@ -521,26 +496,36 @@ PLAYER_HTML = """<!DOCTYPE html>
                         }
                     }
                 }
-            });
+            }, function() {
+                var p = this;
 
-            if (subPath) {
-                player.ready(() => {
-                    player.addRemoteTextTrack({
-                        kind: 'subtitles',
+                // Nastavení zdroje přes resolution switcher
+                p.updateSrc([
+                    {
+                        src: '/stream?path=' + encodeURIComponent(videoPath),
+                        type: 'video/mp4',
+                        label: 'Originál'
+                    }
+                ]);
+
+                // Připojení vybraných titulků
+                if (subPath) {
+                    p.addRemoteTextTrack({
+                        kind: 'captions',
                         srclang: 'cs',
-                        label: 'Titulky',
+                        label: 'Titulky: cze',
                         src: '/subtitle?path=' + encodeURIComponent(subPath),
                         default: true
                     }, false);
 
-                    setTimeout(() => {
-                        const tracks = player.textTracks();
+                    setTimeout(function() {
+                        var tracks = p.textTracks();
                         if (tracks && tracks[0]) {
                             tracks[0].mode = 'showing';
                         }
-                    }, 200);
-                });
-            }
+                    }, 250);
+                }
+            });
         }
     </script>
 </body>
@@ -548,7 +533,7 @@ PLAYER_HTML = """<!DOCTYPE html>
 """
 
 def convert_srt_to_vtt(srt_text: str) -> str:
-    """Converts SRT timestamp format (00:00:00,000) to WebVTT format (00:00:00.000)."""
+    """Konverze SRT časových značek do WebVTT formátu."""
     vtt = "WEBVTT\n\n"
     converted = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', srt_text)
     return vtt + converted
@@ -557,10 +542,9 @@ def convert_srt_to_vtt(srt_text: str) -> str:
 class MediaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
-        pass  # Quiet logging for performance
+        pass
 
     def is_safe_path(self, rel_path: str) -> bool:
-        """Prevent Directory Traversal attacks."""
         abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
         return os.path.commonpath([MEDIA_DIR, abs_path]) == MEDIA_DIR and os.path.exists(abs_path)
 
@@ -569,9 +553,9 @@ class MediaHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # 1. Main Media Library Catalog
+        # 1. Hlavní katalog knihovny Televize
         if path in ("/", "/index.html"):
-            html = CATALOG_HTML.replace("__MEDIA_DIR__", MEDIA_DIR)
+            html = LIBRARY_HTML.replace("__MEDIA_DIR__", MEDIA_DIR)
             content = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -580,7 +564,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        # 2. Dedicated Video.js Player Page (New Tab)
+        # 2. Přehrávač Video.js (v nové kartě)
         elif path == "/player":
             content = PLAYER_HTML.encode("utf-8")
             self.send_response(200)
@@ -590,10 +574,10 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        # 3. JSON API with media & subtitle files
-        elif path == "/api/media":
-            videos = []
-            subtitles = []
+        # 3. API pro stránkování a vyhledávání videí (pro nekonečný scroll)
+        elif path in ("/api/videos", "/api/media"):
+            all_videos = []
+            all_subtitles = []
 
             for root, _, files in os.walk(MEDIA_DIR):
                 for f in sorted(files):
@@ -606,11 +590,60 @@ class MediaHandler(BaseHTTPRequestHandler):
 
                     item = {"name": f, "path": rel_path, "dir": rel_dir}
                     if ext in VIDEO_EXTENSIONS:
-                        videos.append(item)
+                        all_videos.append(item)
                     elif ext in SUBTITLE_EXTENSIONS:
-                        subtitles.append(item)
+                        all_subtitles.append(item)
 
-            data = json.dumps({"videos": videos, "subtitles": subtitles}).encode("utf-8")
+            # Filtrování podle dotazu 'q'
+            search_query = query.get("q", [""])[0].lower().strip()
+            if search_query:
+                filtered_videos = [
+                    v for v in all_videos
+                    if search_query in v["name"].lower() or search_query in v["dir"].lower()
+                ]
+            else:
+                filtered_videos = all_videos
+
+            # Stránkování (page, limit)
+            try:
+                page = int(query.get("page", ["1"])[0])
+                limit = int(query.get("limit", ["20"])[0])
+            except ValueError:
+                page, limit = 1, 20
+
+            start_idx = (page - 1) * limit
+            end_idx = start_idx + limit
+            paged_videos = filtered_videos[start_idx:end_idx]
+
+            # Příprava položek s titulkami
+            response_items = []
+            for v in paged_videos:
+                v_base = os.path.splitext(v["name"])[0].lower()
+
+                # Hledání shodných titulků
+                matched_sub = None
+                available_subs = []
+                for s in all_subtitles:
+                    s_base = os.path.splitext(s["name"])[0].lower()
+                    is_match = (s_base == v_base)
+                    if is_match and not matched_sub:
+                        matched_sub = s["path"]
+                    available_subs.append({
+                        "name": s["name"],
+                        "path": s["path"],
+                        "matched": is_match
+                    })
+
+                response_items.append({
+                    "title": v["name"],
+                    "path": v["path"],
+                    "dir": v["dir"],
+                    "thumbnail": DEFAULT_THUMBNAIL,
+                    "matchedSub": matched_sub,
+                    "availableSubtitles": available_subs
+                })
+
+            data = json.dumps(response_items).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -619,11 +652,11 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        # 4. Subtitle serving with SRT -> WebVTT conversion
+        # 4. Streamování titulků s dynamickou konverzí do WebVTT
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Subtitle not found")
+                self.send_error(404, "Titulky nenalezeny")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -650,108 +683,7 @@ class MediaHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(encoded)
             except Exception as e:
-                self.send_error(500, f"Error: {e}")
+                self.send_error(500, f"Chyba: {e}")
             return
 
-        # 5. Video streaming with HTTP 206 Range requests
-        elif path == "/stream":
-            rel_path = query.get("path", [""])[0]
-            if not self.is_safe_path(rel_path):
-                self.send_error(404, "Video not found")
-                return
-
-            full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
-            self.handle_range_streaming(full_path)
-            return
-
-        else:
-            self.send_error(404, "Not Found")
-
-    def handle_range_streaming(self, file_path: str):
-        try:
-            file_size = os.path.getsize(file_path)
-        except OSError:
-            self.send_error(404, "Video not found")
-            return
-
-        mime_type, _ = mimetypes.guess_type(file_path)
-        if not mime_type:
-            mime_type = "video/mp4"
-
-        range_header = self.headers.get("Range")
-
-        # No Range requested -> send full file
-        if not range_header:
-            self.send_response(200)
-            self.send_header("Content-Type", mime_type)
-            self.send_header("Content-Length", str(file_size))
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
-
-            try:
-                with open(file_path, "rb") as f:
-                    while chunk := f.read(CHUNK_SIZE):
-                        self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
-
-        range_match = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
-        if not range_match:
-            self.send_response(416)
-            self.send_header("Content-Range", f"bytes */{file_size}")
-            self.end_headers()
-            return
-
-        start_str, end_str = range_match.groups()
-        start = int(start_str) if start_str else 0
-        end = int(end_str) if end_str else file_size - 1
-
-        if start >= file_size or start > end:
-            self.send_response(416)
-            self.send_header("Content-Range", f"bytes */{file_size}")
-            self.end_headers()
-            return
-
-        if end >= file_size:
-            end = file_size - 1
-
-        content_length = (end - start) + 1
-
-        self.send_response(206)
-        self.send_header("Content-Type", mime_type)
-        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-        self.send_header("Content-Length", str(content_length))
-        self.send_header("Accept-Ranges", "bytes")
-        self.end_headers()
-
-        try:
-            with open(file_path, "rb") as f:
-                f.seek(start)
-                bytes_left = content_length
-                while bytes_left > 0:
-                    read_bytes = min(CHUNK_SIZE, bytes_left)
-                    chunk = f.read(read_bytes)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    bytes_left -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-
-def run_server():
-    os.makedirs(MEDIA_DIR, exist_ok=True)
-    print(f"=== Televize Media Server ===")
-    print(f"Media Directory : {MEDIA_DIR}")
-    print(f"Server Running  : http://{HOST}:{PORT}")
-    server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping server...")
-        server.server_close()
-
-
-if __name__ == "__main__":
-    run_server()
+        # 5. Streamování videa s podporou HTTP 206 Range
