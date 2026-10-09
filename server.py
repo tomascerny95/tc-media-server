@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-TC-Media Server - Custom Televize Library & Video.js 7 Player.
-- Library page: Faithful implementation of the Televize card grid & infinite scroll.
-- Player page: Robust Video.js 7 setup with Hotkeys, Mobile-UI & dynamic subtitles.
+TC-Media Server - Custom Televize Library & Cinema Player.
+- Library page: Televize card grid & instant links.
+- Player page: Robust player with immediate stream loading & subtitle support.
 - HTTP 206 Range streaming & automatic SRT to WebVTT conversion.
 """
 import os
@@ -173,19 +173,19 @@ LIBRARY_HTML = """<!DOCTYPE html>
             text-align: center;
             margin-top: auto;
         }
-        .video-links button {
+        .video-links .play-link {
+            display: inline-block;
             background-color: transparent;
             border: 1px solid #e54c4c;
             color: #e54c4c;
-            padding: 6px 14px;
-            margin: 0 4px;
+            padding: 6px 16px;
             border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.8rem;
-            font-weight: 500;
+            text-decoration: none;
+            font-size: 0.85rem;
+            font-weight: 600;
             transition: background-color 0.2s, color 0.2s;
         }
-        .video-links button:hover {
+        .video-links .play-link:hover {
             background-color: #e54c4c;
             color: #ffffff;
         }
@@ -259,41 +259,39 @@ LIBRARY_HTML = """<!DOCTYPE html>
                         });
                     }
 
-                    var initialSub = video.matchedSub ? '&sub=' + encodeURIComponent(video.matchedSub) : '';
-                    var playUrl = '/player?video=' + encodeURIComponent(video.path) + initialSub;
+                    function makeUrl(subPath) {
+                        return '/player?video=' + encodeURIComponent(video.path) + (subPath ? '&sub=' + subPath : '');
+                    }
+
+                    var initSub = video.matchedSub ? encodeURIComponent(video.matchedSub) : '';
+                    var currentUrl = makeUrl(initSub);
 
                     videoItem.innerHTML =
-                        '<a href="' + playUrl + '" target="_blank" class="thumb-link">' +
+                        '<a href="' + currentUrl + '" target="_blank" class="thumb-link">' +
                             '<div class="video-thumbnail">' +
                                 '<img src="' + video.thumbnail + '" alt="Náhled: ' + video.title + '" loading="lazy">' +
                             '</div>' +
                         '</a>' +
                         '<div class="video-details">' +
-                            '<a href="' + playUrl + '" target="_blank" class="video-title-link title-link">' +
+                            '<a href="' + currentUrl + '" target="_blank" class="video-title-link title-link">' +
                                 '<p title="' + video.title + '">' + video.title + '</p>' +
                             '</a>' +
                             '<select class="sub-select" title="Vybrat titulky">' + optionsHtml + '</select>' +
                             '<div class="video-links">' +
-                                '<button type="button" class="btn-open">Přehrát ↗</button>' +
+                                '<a href="' + currentUrl + '" target="_blank" class="play-link">Přehrát ↗</a>' +
                             '</div>' +
                         '</div>';
 
                     var selectEl = videoItem.querySelector('.sub-select');
                     var thumbLink = videoItem.querySelector('.thumb-link');
                     var titleLink = videoItem.querySelector('.title-link');
-                    var btnOpen = videoItem.querySelector('.btn-open');
+                    var playLink = videoItem.querySelector('.play-link');
 
-                    function updateUrls() {
-                        var sub = selectEl.value;
-                        var newUrl = '/player?video=' + encodeURIComponent(video.path) + (sub ? '&sub=' + sub : '');
-                        thumbLink.href = newUrl;
-                        titleLink.href = newUrl;
-                        return newUrl;
-                    }
-
-                    selectEl.addEventListener('change', updateUrls);
-                    btnOpen.addEventListener('click', function() {
-                        window.open(updateUrls(), '_blank');
+                    selectEl.addEventListener('change', function() {
+                        var updated = makeUrl(selectEl.value);
+                        thumbLink.href = updated;
+                        titleLink.href = updated;
+                        playLink.href = updated;
                     });
 
                     fragment.appendChild(videoItem);
@@ -356,7 +354,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
 </html>
 """
 
-# --- 2. ŠABLONA PŘEHRÁVAČE (VIDEO.JS + HOTKEYS + MOBILE-UI) ---
+# --- 2. ŠABLONA PŘEHRÁVAČE (PŘÍMÉ STREAMOVÁNÍ + KONTROLA) ---
 PLAYER_HTML = """<!DOCTYPE html>
 <html lang="cs">
 <head>
@@ -364,31 +362,29 @@ PLAYER_HTML = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Přehrávání</title>
     <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: black;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #000000;
             color: #f0f0f0;
-            margin: 0;
-            padding: 0;
+            height: 100vh;
             display: flex;
             flex-direction: column;
-            min-height: 100vh;
             overflow: hidden;
         }
         .player-header {
             width: 100%;
             background-color: #1e242c;
-            padding: 10px 20px;
+            padding: 12px 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            box-sizing: border-box;
             border-bottom: 1px solid #3a414c;
             z-index: 10;
         }
         .player-title {
             font-weight: 600;
-            font-size: 1rem;
+            font-size: 1.05rem;
             color: #ffffff;
             white-space: nowrap;
             overflow: hidden;
@@ -398,8 +394,9 @@ PLAYER_HTML = """<!DOCTYPE html>
         .player-close {
             color: #e54c4c;
             text-decoration: none;
-            font-size: 0.9rem;
+            font-size: 0.95rem;
             font-weight: 600;
+            transition: color 0.15s;
         }
         .player-close:hover {
             color: #ff6b6b;
@@ -407,44 +404,24 @@ PLAYER_HTML = """<!DOCTYPE html>
         .video-box {
             flex: 1;
             width: 100%;
-            height: calc(100vh - 45px);
+            height: calc(100vh - 50px);
             display: flex;
             justify-content: center;
             align-items: center;
-            background: #000;
+            background: #000000;
         }
-        .video-js {
-            width: 100% !important;
-            height: 100% !important;
-        }
-        .video-js .vjs-big-play-button {
-            background-color: rgba(229, 76, 76, 0.85) !important;
-            border-color: #e54c4c !important;
-            border-radius: 50% !important;
-            width: 70px !important;
-            height: 70px !important;
-            line-height: 70px !important;
-            top: 50% !important;
-            left: 50% !important;
-            transform: translate(-50%, -50%) !important;
-        }
-        .video-js .vjs-play-progress {
-            background-color: #e54c4c !important;
+        video {
+            width: 100%;
+            height: 100%;
+            max-height: calc(100vh - 50px);
+            outline: none;
         }
         video::cue {
-            background-color: rgba(0, 0, 0, 0.8) !important;
-            color: #ffffff !important;
-            font-size: 1.25rem !important;
+            background-color: rgba(0, 0, 0, 0.8);
+            color: #ffffff;
+            font-size: 1.25rem;
         }
     </style>
-
-    <!-- Stabilní oficiální CDN knihovny Video.js a pluginů -->
-    <link rel="stylesheet" href="https://vjs.zencdn.net/7.20.3/video-js.min.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/videojs-mobile-ui@0.7.0/dist/videojs-mobile-ui.css" />
-
-    <script src="https://vjs.zencdn.net/7.20.3/video.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/videojs-hotkeys@0.2.28/videojs.hotkeys.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/videojs-mobile-ui@0.7.0/dist/videojs-mobile-ui.min.js"></script>
 </head>
 <body>
     <div class="player-header">
@@ -453,10 +430,8 @@ PLAYER_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="video-box">
-        <video id="videoPlayer" class="video-js vjs-default-skin vjs-big-play-centered" controls playsinline preload="auto">
-            <p class="vjs-no-js">
-                Pro zobrazení videa povolte JavaScript a použijte prohlížeč podporující HTML5 video.
-            </p>
+        <video id="videoPlayer" controls autoplay playsinline preload="auto">
+            Váš prohlížeč nepodporuje HTML5 video.
         </video>
     </div>
 
@@ -465,72 +440,64 @@ PLAYER_HTML = """<!DOCTYPE html>
         var videoPath = params.get('video');
         var subPath = params.get('sub');
         var heading = document.getElementById('videoHeading');
+        var player = document.getElementById('videoPlayer');
 
         if (!videoPath) {
-            heading.textContent = 'Chyba: Nebylo specifikováno žádné video.';
+            heading.textContent = 'Chyba: Nebylo vybráno žádné video v URL parametru.';
         } else {
-            var fileName = decodeURIComponent(videoPath).split('/').pop().split('\\').pop();
+            var decoded = decodeURIComponent(videoPath);
+            var fileName = decoded.split('/').pop().split('\\').pop();
             document.title = fileName + ' - Televize';
             heading.textContent = fileName;
 
-            var ext = fileName.split('.').pop().toLowerCase();
-            var mimeType = 'video/mp4';
-            if (ext === 'webm') mimeType = 'video/webm';
-            else if (ext === 'mkv') mimeType = 'video/x-matroska';
+            // Nastavení přímého zdroje pro streamování
+            player.src = '/stream?path=' + encodeURIComponent(videoPath);
 
-            var player = videojs('videoPlayer', {
-                controls: true,
-                autoplay: true,
-                sources: [{
-                    src: '/stream?path=' + encodeURIComponent(videoPath),
-                    type: mimeType
-                }]
+            // Nastavení titulků, pokud byly předány
+            if (subPath) {
+                var track = document.createElement('track');
+                track.kind = 'subtitles';
+                track.srclang = 'cs';
+                track.label = 'Titulky';
+                track.src = '/subtitle?path=' + encodeURIComponent(subPath);
+                track.default = true;
+                player.appendChild(track);
+
+                setTimeout(function() {
+                    if (player.textTracks && player.textTracks[0]) {
+                        player.textTracks[0].mode = 'showing';
+                    }
+                }, 200);
+            }
+
+            // Klávesové zkratky pro pohodlné ovládání
+            window.addEventListener('keydown', function(e) {
+                if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+                if (e.key === ' ' || e.code === 'Space') {
+                    e.preventDefault();
+                    if (player.paused) player.play(); else player.pause();
+                } else if (e.key === 'ArrowRight') {
+                    player.currentTime = Math.min(player.duration, player.currentTime + 5);
+                } else if (e.key === 'ArrowLeft') {
+                    player.currentTime = Math.max(0, player.currentTime - 5);
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    player.volume = Math.min(1, player.volume + 0.1);
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    player.volume = Math.max(0, player.volume - 0.1);
+                } else if (e.key === 'f' || e.key === 'F') {
+                    if (!document.fullscreenElement) {
+                        player.requestFullscreen().catch(function(){});
+                    } else {
+                        document.exitFullscreen().catch(function(){});
+                    }
+                }
             });
 
-            // Aktivace klávesových zkratek (Hotkeys)
-            if (typeof player.hotkeys === 'function') {
-                player.hotkeys({
-                    volumeStep: 0.1,
-                    seekStep: 5,
-                    enableModifiersForNumbers: false
-                });
-            }
-
-            // Aktivace mobilních gest (Mobile-UI)
-            if (typeof player.mobileUi === 'function') {
-                player.mobileUi({
-                    fullscreen: {
-                        enterOnRotate: true,
-                        exitOnRotate: true,
-                        lockOnRotate: false,
-                        iOS: false
-                    },
-                    touchControls: {
-                        seekSeconds: 10,
-                        tapTimeout: 300
-                    }
-                });
-            }
-
-            // Připojení vybraných titulků
-            if (subPath) {
-                player.ready(function() {
-                    player.addRemoteTextTrack({
-                        kind: 'captions',
-                        srclang: 'cs',
-                        label: 'Titulky: cze',
-                        src: '/subtitle?path=' + encodeURIComponent(subPath),
-                        default: true
-                    }, false);
-
-                    setTimeout(function() {
-                        var tracks = player.textTracks();
-                        if (tracks && tracks[0]) {
-                            tracks[0].mode = 'showing';
-                        }
-                    }, 300);
-                });
-            }
+            player.play().catch(function(err) {
+                console.log("Autoplay čeká na interakci uživatele:", err);
+            });
         }
     </script>
 </body>
