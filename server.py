@@ -4,7 +4,7 @@ TC-Media Server - Televize Library & Video.js Player.
 - Detekce titulků a zvukových stop (Čeština [aac], Angličtina [eac3]...).
 - Živý on-the-fly streaming s bleskovým převodem EAC3 -> AAC.
 - Web Audio API pro oddělení hlasitosti.
-- Okamžitá synchronizace bez zamrzání přehrávače.
+- Ochrana proti cyklení restartu streamu (vyřešen 5s freeze loop).
 """
 import os
 import sys
@@ -285,6 +285,7 @@ def build_player_page(video_path: str) -> str:
 \t\tvar isAltAudio = false;
 
 \t\tvar altAudioBaseTime = 0;
+\t\tvar isProgrammaticSeek = false;
 \t\tvar audioCtx = null;
 \t\tvar videoGain = null;
 
@@ -337,6 +338,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\taltAudio.muted = p.muted();
 \t\t\t\t}} else {{
 \t\t\t\t\tif (videoGain) videoGain.gain.value = 1;
+\t\t\t\t\taltAudio.pause();
 \t\t\t\t}}
 \t\t\t}}
 
@@ -350,13 +352,18 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + targetTime;
 \t\t\t\taltAudio.volume = p.volume();
 \t\t\t\taltAudio.muted = p.muted();
+\t\t\t\taltAudio.playbackRate = p.playbackRate();
 \t\t\t\taltAudio.load();
 
 \t\t\t\tvar onAudioReady = function() {{
 \t\t\t\t\taltAudio.removeEventListener('playing', onAudioReady);
 \t\t\t\t\tif (isAltAudio) {{
-\t\t\t\t\t\t// Jakmile zvuk reálně začne hrát, docvakneme video na stejný čas
-\t\t\t\t\t\tp.currentTime(targetTime);
+\t\t\t\t\t\tvar diff = p.currentTime() - targetTime;
+\t\t\t\t\t\t// Pokud video během startu zvuku mírně uteklo, srovnáme ho bez vyvolání restartu
+\t\t\t\t\t\tif (Math.abs(diff) > 0.15) {{
+\t\t\t\t\t\t\tisProgrammaticSeek = true;
+\t\t\t\t\t\t\tp.currentTime(targetTime);
+\t\t\t\t\t\t}}
 \t\t\t\t\t\tupdateLevels();
 \t\t\t\t\t}}
 \t\t\t\t}};
@@ -374,12 +381,8 @@ def build_player_page(video_path: str) -> str:
 \t\t\tp.on('play', function() {{
 \t\t\t\tensureAudioGraph();
 \t\t\t\tupdateLevels();
-\t\t\t\tif (isAltAudio) {{
-\t\t\t\t\tif (!altAudio.src || altAudio.paused) {{
-\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
-\t\t\t\t\t}} else {{
-\t\t\t\t\t\taltAudio.play().catch(function(e){{}});
-\t\t\t\t\t}}
+\t\t\t\tif (isAltAudio && altAudio.src && altAudio.paused) {{
+\t\t\t\t\taltAudio.play().catch(function(e){{}});
 \t\t\t\t}}
 \t\t\t}});
 
@@ -388,12 +391,17 @@ def build_player_page(video_path: str) -> str:
 \t\t\t}});
 
 \t\t\tp.on('seeked', function() {{
+\t\t\t\t// Zabráníme nekonečné smyčce: ignorujeme seek vyvolaný interním srovnáním času
+\t\t\t\tif (isProgrammaticSeek) {{
+\t\t\t\t\tisProgrammaticSeek = false;
+\t\t\t\t\treturn;
+\t\t\t\t}}
 \t\t\t\tif (isAltAudio) {{
 \t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t}}
 \t\t\t}});
 
-\t\t\t// Jemné průběžné ladění synchronizace
+\t\t\t// Průběžné jemné dolaďování rychlosti zvuku (lip-sync) bez skákání videa
 \t\t\tsetInterval(function() {{
 \t\t\t\tif (!isAltAudio || p.paused() || altAudio.paused || altAudio.readyState < 2) return;
 
@@ -401,17 +409,14 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\tvar currentVideoTime = p.currentTime();
 \t\t\t\tvar diff = currentVideoTime - currentAudioTime;
 
-\t\t\t\tif (Math.abs(diff) < 0.1) {{
+\t\t\t\tif (Math.abs(diff) < 0.08) {{
 \t\t\t\t\taltAudio.playbackRate = p.playbackRate();
 \t\t\t\t}}
-\t\t\t\telse if (diff > 0.1 && diff < 0.5) {{
+\t\t\t\telse if (diff > 0.08 && diff < 0.6) {{
 \t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 1.05;
 \t\t\t\t}}
-\t\t\t\telse if (diff < -0.1 && diff > -0.5) {{
+\t\t\t\telse if (diff < -0.08 && diff > -0.6) {{
 \t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 0.95;
-\t\t\t\t}}
-\t\t\t\telse if (Math.abs(diff) >= 0.5) {{
-\t\t\t\t\tp.currentTime(currentAudioTime);
 \t\t\t\t}}
 \t\t\t}}, 500);
 
@@ -686,7 +691,6 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Content-Length", str(content_length))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         try:
