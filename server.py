@@ -3,10 +3,10 @@
 TC-Media Server - Media Library & Video.js Player.
 - Automated detection of subtitles and audio tracks.
 - Direct Play (HTTP 206) for default audio tracks.
-- Ultra-fast HLS streaming for secondary audio tracks (EAC3->AAC):
+- Ultra-fast in-memory HLS streaming for secondary audio tracks (EAC3->AAC):
   Atomic segment creation (temp_file flag prevents corrupt partial reads),
   zero SD card wear (RAM disk via /dev/shm), 100% compatible with Smart TVs & Mobile.
-- Clean Video.js configuration without blocking native video tracks or CORS locks.
+- Unblocked ffmpeg process pipeline (fixed stderr buffer deadlock).
 """
 import os
 import sys
@@ -386,7 +386,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t\t\t\tisSwitching = false;
 \t\t\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
 \t\t\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
-\t\t\t\t\t\t\t\t\t\t\tp.play();
+\t\t\t\t\t\t\t\t\t\t\tp.play().catch(function(e){{}});
 \t\t\t\t\t\t\t\t\t\t}} else {{
 \t\t\t\t\t\t\t\t\t\t\talert('Stream error: ' + (data.message || 'Unknown error'));
 \t\t\t\t\t\t\t\t\t\t}}
@@ -410,7 +410,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t.then(function(data) {{
 \t\t\t\t\t\t\t\tif (data.status === 'ready') {{
 \t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
-\t\t\t\t\t\t\t\t\tp.play();
+\t\t\t\t\t\t\t\t\tp.play().catch(function(e){{}});
 \t\t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\t}});
 \t\t\t\t\t}}
@@ -527,7 +527,7 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             m3u8_file = os.path.join(session_dir, "stream.m3u8")
 
-            cmd = ["ffmpeg", "-v", "warning", "-y"]
+            cmd = ["ffmpeg", "-v", "error", "-y"]
             try:
                 t_val = float(start_t)
                 if t_val > 0:
@@ -550,20 +550,18 @@ class MediaHandler(BaseHTTPRequestHandler):
             ])
 
             print(f"[+] Starting in-memory HLS stream (RAM) for track #{track_idx} at {start_t}s...")
+            # DŮLEŽITÉ: stdout a stderr jsou DEVNULL, aby nedocházelo k zamrznutí vyrovnávací paměti procesu
             active_hls_proc = subprocess.Popen(
                 cmd,
                 cwd=session_dir,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True
+                stderr=subprocess.DEVNULL
             )
 
             is_ready = False
-            error_msg = ""
             for _ in range(300):
                 if active_hls_proc.poll() is not None:
-                    error_msg = active_hls_proc.stderr.read()
-                    print(f"[!] FFmpeg error: {error_msg}")
+                    print("[!] FFmpeg process terminated early.")
                     break
 
                 if os.path.exists(m3u8_file) and os.path.getsize(m3u8_file) > 20:
@@ -578,7 +576,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             if is_ready:
                 resp = json.dumps({"status": "ready", "url": "/hls/session/stream.m3u8"}).encode("utf-8")
             else:
-                resp = json.dumps({"status": "error", "message": error_msg or "Timeout generating stream"}).encode("utf-8")
+                resp = json.dumps({"status": "error", "message": "Timeout generating stream"}).encode("utf-8")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -614,7 +612,7 @@ class MediaHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 self.end_headers()
                 self.wfile.write(data)
             except Exception as e:
