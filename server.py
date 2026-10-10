@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 TC-Media Server - Media Library & Video.js Player.
-- Automated detection of subtitles and injection as <track> elements.
-- Audio track discovery via ffprobe (English [eac3], Czech [aac], etc.).
-- Real-time on-the-fly audio streaming with EAC3/AC3 to AAC conversion.
-- Web Audio API integration for independent volume control.
-- Seamless video/audio synchronization with loop-prevention guards.
+- Automated detection of subtitles and audio tracks.
+- Direct Play for default tracks + Fast on-demand MP4 remux for secondary audio (EAC3->AAC).
+- 100% compatible with Smart TVs (Vewd, Opera TV, Tizen, WebOS), Android, iOS, and PC.
 """
 import os
 import sys
 import re
 import json
 import shutil
+import hashlib
+import tempfile
 import subprocess
 import mimetypes
 import urllib.parse
@@ -22,6 +22,7 @@ HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.html")
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "tc_media_cache")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
@@ -46,7 +47,6 @@ mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/webm", ".webm")
 mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
-mimetypes.add_type("audio/aac", ".aac")
 mimetypes.add_type("text/vtt", ".vtt")
 
 FAVICON_BASE64 = (
@@ -252,7 +252,7 @@ def get_audio_tracks(video_rel_path: str):
 
 def build_player_page(video_path: str) -> str:
     file_name = os.path.basename(video_path) if video_path else "Player"
-    stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
+    stream_url = f"/stream?path={urllib.parse.quote(video_path)}&audio=0" if video_path else ""
 
     track_tags = []
     if video_path:
@@ -271,25 +271,37 @@ def build_player_page(video_path: str) -> str:
     html = f"""<head>
 \t<title>{file_name} - TC-Media Server</title>
 \t<link rel="shortcut icon" href="{FAVICON_BASE64}" />
+\t<style>
+\t\t#tv-spinner {{
+\t\t\tdisplay: none;
+\t\t\tposition: absolute;
+\t\t\ttop: 50%;
+\t\t\tleft: 50%;
+\t\t\ttransform: translate(-50%, -50%);
+\t\t\tz-index: 1000;
+\t\t\tbackground: rgba(0, 0, 0, 0.85);
+\t\t\tcolor: white;
+\t\t\tpadding: 20px 30px;
+\t\t\tborder-radius: 8px;
+\t\t\tfont-size: 1.2rem;
+\t\t\tfont-family: sans-serif;
+\t\t\ttext-align: center;
+\t\t\tborder: 1px solid #444;
+\t\t}}
+\t</style>
 </head>
 {buffer_inject}<body>
+\t<div id="tv-spinner">Switching audio track... Please wait a few seconds.</div>
 \t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto" crossorigin="anonymous">
 \t\t<source src="{stream_url}" type="video/mp4">
 {tracks_html}
-\t\t<p class="vjs-no-js">To view this video please enable JavaScript, and consider upgrading to a web browser that <a href="https://videojs.com/html5-video-support/" target="_blank">supports HTML5 video</a>.</p>
+\t\t<p class="vjs-no-js">To view this video please enable JavaScript.</p>
 \t</video>
-\t<audio id="altAudio" preload="auto" style="display:none;"></audio>
 \t<script>
 \t\tvar audioTracksData = {audio_tracks_json};
 \t\tvar currentAudioId = "0";
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
-\t\tvar altAudio = document.getElementById('altAudio');
-\t\tvar isAltAudio = false;
-
-\t\tvar altAudioBaseTime = 0;
-\t\tvar isProgrammaticSeek = false;
-\t\tvar audioCtx = null;
-\t\tvar videoGain = null;
+\t\tvar spinner = document.getElementById('tv-spinner');
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
@@ -316,108 +328,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\t}}
 \t\t}}, function() {{
 \t\t\tvar p = this;
-\t\t\tvar rawVideo = p.el().querySelector('video');
-
-\t\t\tfunction ensureAudioGraph() {{
-\t\t\t\tif (!audioCtx) {{
-\t\t\t\t\ttry {{
-\t\t\t\t\t\taudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-\t\t\t\t\t\tvar src = audioCtx.createMediaElementSource(rawVideo);
-\t\t\t\t\t\tvideoGain = audioCtx.createGain();
-\t\t\t\t\t\tsrc.connect(videoGain);
-\t\t\t\t\t\tvideoGain.connect(audioCtx.destination);
-\t\t\t\t\t}} catch (e) {{}}
-\t\t\t\t}}
-\t\t\t\tif (audioCtx && audioCtx.state === 'suspended') {{
-\t\t\t\t\taudioCtx.resume();
-\t\t\t\t}}
-\t\t\t}}
-
-\t\t\tfunction updateLevels() {{
-\t\t\t\tif (isAltAudio) {{
-\t\t\t\t\tif (videoGain) videoGain.gain.value = 0;
-\t\t\t\t\taltAudio.volume = p.volume();
-\t\t\t\t\taltAudio.muted = p.muted();
-\t\t\t\t}} else {{
-\t\t\t\t\tif (videoGain) videoGain.gain.value = 1;
-\t\t\t\t\taltAudio.pause();
-\t\t\t\t}}
-\t\t\t}}
-
-\t\t\tfunction startAltAudioStream(seekTime) {{
-\t\t\t\tif (!isAltAudio) return;
-\t\t\t\tensureAudioGraph();
-
-\t\t\t\tvar targetTime = Math.max(0, seekTime !== undefined ? seekTime : (p.currentTime() || 0));
-\t\t\t\taltAudioBaseTime = targetTime;
-
-\t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + targetTime;
-\t\t\t\taltAudio.volume = p.volume();
-\t\t\t\taltAudio.muted = p.muted();
-\t\t\t\taltAudio.playbackRate = p.playbackRate();
-\t\t\t\taltAudio.load();
-
-\t\t\t\tvar onAudioReady = function() {{
-\t\t\t\t\taltAudio.removeEventListener('playing', onAudioReady);
-\t\t\t\t\tif (isAltAudio) {{
-\t\t\t\t\t\tvar diff = p.currentTime() - targetTime;
-\t\t\t\t\t\tif (Math.abs(diff) > 0.15) {{
-\t\t\t\t\t\t\tisProgrammaticSeek = true;
-\t\t\t\t\t\t\tp.currentTime(targetTime);
-\t\t\t\t\t\t}}
-\t\t\t\t\t\tupdateLevels();
-\t\t\t\t\t}}
-\t\t\t\t}};
-
-\t\t\t\taltAudio.addEventListener('playing', onAudioReady, {{ once: true }});
-\t\t\t\tif (!p.paused()) {{
-\t\t\t\t\taltAudio.play().catch(function(e){{}});
-\t\t\t\t}}
-\t\t\t}}
-
-\t\t\tp.on('volumechange', function() {{
-\t\t\t\tupdateLevels();
-\t\t\t}});
-
-\t\t\tp.on('play', function() {{
-\t\t\t\tensureAudioGraph();
-\t\t\t\tupdateLevels();
-\t\t\t\tif (isAltAudio && altAudio.src && altAudio.paused) {{
-\t\t\t\t\taltAudio.play().catch(function(e){{}});
-\t\t\t\t}}
-\t\t\t}});
-
-\t\t\tp.on('pause', function() {{
-\t\t\t\tif (isAltAudio) altAudio.pause();
-\t\t\t}});
-
-\t\t\tp.on('seeked', function() {{
-\t\t\t\tif (isProgrammaticSeek) {{
-\t\t\t\t\tisProgrammaticSeek = false;
-\t\t\t\t\treturn;
-\t\t\t\t}}
-\t\t\t\tif (isAltAudio) {{
-\t\t\t\t\tstartAltAudioStream(p.currentTime());
-\t\t\t\t}}
-\t\t\t}});
-
-\t\t\tsetInterval(function() {{
-\t\t\t\tif (!isAltAudio || p.paused() || altAudio.paused || altAudio.readyState < 2) return;
-
-\t\t\t\tvar currentAudioTime = altAudioBaseTime + altAudio.currentTime;
-\t\t\t\tvar currentVideoTime = p.currentTime();
-\t\t\t\tvar diff = currentVideoTime - currentAudioTime;
-
-\t\t\t\tif (Math.abs(diff) < 0.08) {{
-\t\t\t\t\taltAudio.playbackRate = p.playbackRate();
-\t\t\t\t}}
-\t\t\t\telse if (diff > 0.08 && diff < 0.6) {{
-\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 1.05;
-\t\t\t\t}}
-\t\t\t\telse if (diff < -0.08 && diff > -0.6) {{
-\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 0.95;
-\t\t\t\t}}
-\t\t\t}}, 500);
 
 \t\t\tif (audioTracksData.length > 1) {{
 \t\t\t\taudioTracksData.forEach(function(t) {{
@@ -431,20 +341,31 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}});
 
 \t\t\t\tp.audioTracks().addEventListener('change', function() {{
-\t\t\t\t\tensureAudioGraph();
 \t\t\t\t\tfor (var i = 0; i < p.audioTracks().length; i++) {{
 \t\t\t\t\t\tvar tr = p.audioTracks()[i];
 \t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
 \t\t\t\t\t\t\tcurrentAudioId = tr.id;
-\t\t\t\t\t\t\tif (tr.id === "0") {{
-\t\t\t\t\t\t\t\tisAltAudio = false;
-\t\t\t\t\t\t\t\taltAudio.pause();
-\t\t\t\t\t\t\t\taltAudio.removeAttribute('src');
-\t\t\t\t\t\t\t\tupdateLevels();
-\t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\tisAltAudio = true;
-\t\t\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
-\t\t\t\t\t\t\t}}
+\t\t\t\t\t\t\tvar savedTime = p.currentTime();
+\t\t\t\t\t\t\tvar wasPaused = p.paused();
+
+\t\t\t\t\t\t\tspinner.style.display = 'block';
+
+\t\t\t\t\t\t\t// Vyžádáme přípravu vybrané audio stopy na serveru
+\t\t\t\t\t\t\tfetch('/api/prepare_audio?path=' + basePath + '&track=' + tr.id)
+\t\t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
+\t\t\t\t\t\t\t\t.then(function(data) {{
+\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
+\t\t\t\t\t\t\t\t\tvar newUrl = '/stream?path=' + basePath + '&audio=' + tr.id;
+\t\t\t\t\t\t\t\t\tp.src({{ src: newUrl, type: 'video/mp4' }});
+\t\t\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
+\t\t\t\t\t\t\t\t\t\tp.currentTime(savedTime);
+\t\t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
+\t\t\t\t\t\t\t\t\t}});
+\t\t\t\t\t\t\t\t}})
+\t\t\t\t\t\t\t\t.catch(function(err) {{
+\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
+\t\t\t\t\t\t\t\t\talert('Error preparing audio: ' + err);
+\t\t\t\t\t\t\t\t}});
 \t\t\t\t\t\t\tbreak;
 \t\t\t\t\t\t}}
 \t\t\t\t\t}}
@@ -470,6 +391,36 @@ class MediaHandler(BaseHTTPRequestHandler):
             return False
         abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
         return os.path.commonpath([MEDIA_DIR, abs_path]) == MEDIA_DIR and os.path.exists(abs_path)
+
+    def get_cached_audio_file(self, full_path: str, track_idx: str) -> str:
+        """Rychle vytvoří MP4 verzi s vybranou audio stopou pro TV i mobil."""
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        safe_key = hashlib.md5(f"{full_path}_{track_idx}".encode()).hexdigest()
+        cache_file = os.path.join(CACHE_DIR, f"{safe_key}.mp4")
+
+        # Pokud už soubor existuje a má velikost, vrátíme ho okamžitě
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1024 * 1024:
+            return cache_file
+
+        print(f"[+] Remuxing audio track #{track_idx} for Smart TV/Mobile: {os.path.basename(full_path)}...")
+        
+        # Bleskový remux: kopíruje video (-c:v copy), vybrané audio převede do AAC stereo
+        cmd = [
+            "ffmpeg", "-v", "error", "-y",
+            "-i", full_path,
+            "-map", "0:v:0",
+            "-map", f"0:a:{track_idx}",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+            "-movflags", "+faststart",
+            cache_file
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        if res.returncode != 0:
+            print(f"[!] FFmpeg remux error: {res.stderr}")
+            return ""
+
+        return cache_file
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -541,6 +492,34 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        elif path == "/api/prepare_audio":
+            rel_path = query.get("path", [""])[0]
+            track_idx = query.get("track", ["0"])[0]
+
+            if not self.is_safe_path(rel_path):
+                self.send_error(404, "Video not found")
+                return
+
+            full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
+
+            # Stopa 0 je výchozí originál, není třeba nic připravovat
+            if track_idx == "0":
+                resp = json.dumps({"status": "ready"}).encode("utf-8")
+            else:
+                ready_file = self.get_cached_audio_file(full_path, track_idx)
+                if ready_file:
+                    resp = json.dumps({"status": "ready"}).encode("utf-8")
+                else:
+                    self.send_error(500, "Failed to prepare audio")
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
@@ -571,65 +550,24 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
+            audio_track = query.get("audio", ["0"])[0]
+
             if not self.is_safe_path(rel_path):
                 self.send_error(404, "Video not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
-            self.handle_range_streaming(full_path)
-            return
 
-        elif path == "/audio_stream":
-            rel_path = query.get("path", [""])[0]
-            track_idx = query.get("track", ["1"])[0]
-            start_t = query.get("t", ["0"])[0]
-
-            if not self.is_safe_path(rel_path):
-                self.send_error(404, "Audio not found")
-                return
-
-            full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
-
-            cmd = ["ffmpeg", "-v", "error"]
-            try:
-                t_val = float(start_t)
-                if t_val > 0:
-                    cmd.extend(["-ss", str(t_val)])
-            except ValueError:
-                pass
-
-            cmd.extend([
-                "-i", full_path,
-                "-map", f"0:a:{track_idx}",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-                "-flush_packets", "1",
-                "-f", "adts",
-                "pipe:1"
-            ])
-
-            proc = None
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/aac")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-
-                while True:
-                    chunk = proc.stdout.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                if proc:
-                    try:
-                        proc.kill()
-                        proc.wait()
-                    except Exception:
-                        pass
+            if audio_track == "0":
+                # Originální soubor přímo z disku
+                self.handle_range_streaming(full_path)
+            else:
+                # Vyžádaný soubor s připraveným audiem pro TV i mobil
+                cached = self.get_cached_audio_file(full_path, audio_track)
+                if cached:
+                    self.handle_range_streaming(cached)
+                else:
+                    self.handle_range_streaming(full_path)
             return
 
         else:
@@ -687,6 +625,8 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         try:
@@ -704,8 +644,10 @@ class MediaHandler(BaseHTTPRequestHandler):
 
 def run_server():
     os.makedirs(MEDIA_DIR, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
     print("=== TC-Media Server ===")
     print(f"Media directory : {MEDIA_DIR}")
+    print(f"Cache directory : {CACHE_DIR}")
     print(f"Running at      : http://{HOST}:{PORT}")
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
