@@ -185,9 +185,7 @@ def build_player_page(video_path: str, sub_path: str) -> str:
 \t<title>{file_name}</title>
 \t<link rel="shortcut icon" href="{FAVICON_BASE64}" />
 </head>
-
 {buffer_inject}
-
 <body>
 \t<video id="videoPlayer" class="video-js vjs-big-play-centered">
 {sub_tag}
