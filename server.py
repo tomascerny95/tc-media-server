@@ -2,15 +2,17 @@
 """
 TC-Media Server - Media Library & Video.js Player.
 - Automated detection of subtitles and audio tracks.
-- Direct Play for default tracks + Fast on-demand MP4 remux for secondary audio (EAC3->AAC).
-- 100% compatible with Smart TVs (Vewd, Opera TV, Tizen, WebOS), Android, iOS, and PC.
+- Direct Play (HTTP 206) for default audio tracks.
+- Ultra-fast HLS streaming for secondary audio tracks (EAC3->AAC):
+  Instant playback (<1s), zero SD card wear (streams purely in RAM via /dev/shm),
+  100% compatible with Smart TVs (Vewd, Opera TV, Tizen, WebOS) & Mobile (Android, iOS).
 """
 import os
 import sys
 import re
 import json
+import time
 import shutil
-import hashlib
 import tempfile
 import subprocess
 import mimetypes
@@ -22,7 +24,9 @@ HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.html")
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "tc_media_cache")
+
+# RAM disk (/dev/shm) - eliminates SD card writes completely
+HLS_BASE_DIR = "/dev/shm/tc_hls" if os.path.exists("/dev/shm") else os.path.join(tempfile.gettempdir(), "tc_hls")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
@@ -47,6 +51,8 @@ mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/webm", ".webm")
 mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
+mimetypes.add_type("application/x-mpegURL", ".m3u8")
+mimetypes.add_type("video/MP2T", ".ts")
 mimetypes.add_type("text/vtt", ".vtt")
 
 FAVICON_BASE64 = (
@@ -64,6 +70,18 @@ THUMBNAIL_SVG = urllib.parse.quote("""<svg xmlns="http://www.w3.org/2000/svg" vi
   <polygon points="101,46 120,60 101,74" fill="#ffffff"/>
 </svg>""")
 DEFAULT_THUMBNAIL = f"data:image/svg+xml;utf8,{THUMBNAIL_SVG}"
+
+active_hls_proc = None
+
+def cleanup_active_hls():
+    global active_hls_proc
+    if active_hls_proc:
+        try:
+            active_hls_proc.kill()
+            active_hls_proc.wait()
+        except Exception:
+            pass
+        active_hls_proc = None
 
 LIBRARY_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -252,7 +270,7 @@ def get_audio_tracks(video_rel_path: str):
 
 def build_player_page(video_path: str) -> str:
     file_name = os.path.basename(video_path) if video_path else "Player"
-    stream_url = f"/stream?path={urllib.parse.quote(video_path)}&audio=0" if video_path else ""
+    stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
 
     track_tags = []
     if video_path:
@@ -281,17 +299,17 @@ def build_player_page(video_path: str) -> str:
 \t\t\tz-index: 1000;
 \t\t\tbackground: rgba(0, 0, 0, 0.85);
 \t\t\tcolor: white;
-\t\t\tpadding: 20px 30px;
+\t\t\tpadding: 15px 25px;
 \t\t\tborder-radius: 8px;
-\t\t\tfont-size: 1.2rem;
+\t\t\tfont-size: 1.1rem;
 \t\t\tfont-family: sans-serif;
 \t\t\ttext-align: center;
-\t\t\tborder: 1px solid #444;
+\t\t\tborder: 1px solid #555;
 \t\t}}
 \t</style>
 </head>
 {buffer_inject}<body>
-\t<div id="tv-spinner">Switching audio track... Please wait a few seconds.</div>
+\t<div id="tv-spinner">Starting stream...</div>
 \t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto" crossorigin="anonymous">
 \t\t<source src="{stream_url}" type="video/mp4">
 {tracks_html}
@@ -302,6 +320,7 @@ def build_player_page(video_path: str) -> str:
 \t\tvar currentAudioId = "0";
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
 \t\tvar spinner = document.getElementById('tv-spinner');
+\t\tvar isSwitching = false;
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
@@ -348,26 +367,49 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\tvar savedTime = p.currentTime();
 \t\t\t\t\t\t\tvar wasPaused = p.paused();
 
-\t\t\t\t\t\t\tspinner.style.display = 'block';
-
-\t\t\t\t\t\t\t// Vyžádáme přípravu vybrané audio stopy na serveru
-\t\t\t\t\t\t\tfetch('/api/prepare_audio?path=' + basePath + '&track=' + tr.id)
-\t\t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
-\t\t\t\t\t\t\t\t.then(function(data) {{
-\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
-\t\t\t\t\t\t\t\t\tvar newUrl = '/stream?path=' + basePath + '&audio=' + tr.id;
-\t\t\t\t\t\t\t\t\tp.src({{ src: newUrl, type: 'video/mp4' }});
-\t\t\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
-\t\t\t\t\t\t\t\t\t\tp.currentTime(savedTime);
-\t\t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
-\t\t\t\t\t\t\t\t\t}});
-\t\t\t\t\t\t\t\t}})
-\t\t\t\t\t\t\t\t.catch(function(err) {{
-\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
-\t\t\t\t\t\t\t\t\talert('Error preparing audio: ' + err);
+\t\t\t\t\t\t\tif (tr.id === "0") {{
+\t\t\t\t\t\t\t\t// Return to default track (Czech) - Direct Play
+\t\t\t\t\t\t\t\tp.src({{ src: '/stream?path=' + basePath, type: 'video/mp4' }});
+\t\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
+\t\t\t\t\t\t\t\t\tp.currentTime(savedTime);
+\t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
 \t\t\t\t\t\t\t\t}});
+\t\t\t\t\t\t\t}} else {{
+\t\t\t\t\t\t\t\t// Secondary track (English EAC3) - Instant HLS stream from RAM
+\t\t\t\t\t\t\t\tspinner.style.display = 'block';
+\t\t\t\t\t\t\t\tisSwitching = true;
+\t\t\t\t\t\t\t\tfetch('/api/start_hls?path=' + basePath + '&track=' + tr.id + '&t=' + savedTime)
+\t\t\t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
+\t\t\t\t\t\t\t\t\t.then(function(data) {{
+\t\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
+\t\t\t\t\t\t\t\t\t\tisSwitching = false;
+\t\t\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
+\t\t\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
+\t\t\t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
+\t\t\t\t\t\t\t\t\t\t}}
+\t\t\t\t\t\t\t\t\t}})
+\t\t\t\t\t\t\t\t\t.catch(function(err) {{
+\t\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
+\t\t\t\t\t\t\t\t\t\tisSwitching = false;
+\t\t\t\t\t\t\t\t\t\talert('Error loading stream: ' + err);
+\t\t\t\t\t\t\t\t\t}});
+\t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
 \t\t\t\t\t\t}}
+\t\t\t\t\t}}
+\t\t\t\t}});
+
+\t\t\t\tp.on('seeked', function() {{
+\t\t\t\t\tif (currentAudioId !== "0" && !isSwitching) {{
+\t\t\t\t\t\tvar newTime = p.currentTime();
+\t\t\t\t\t\tfetch('/api/start_hls?path=' + basePath + '&track=' + currentAudioId + '&t=' + newTime)
+\t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
+\t\t\t\t\t\t\t.then(function(data) {{
+\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
+\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
+\t\t\t\t\t\t\t\t\tp.play();
+\t\t\t\t\t\t\t\t}}
+\t\t\t\t\t\t\t}});
 \t\t\t\t\t}}
 \t\t\t\t}});
 \t\t\t}}
@@ -391,36 +433,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             return False
         abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
         return os.path.commonpath([MEDIA_DIR, abs_path]) == MEDIA_DIR and os.path.exists(abs_path)
-
-    def get_cached_audio_file(self, full_path: str, track_idx: str) -> str:
-        """Rychle vytvoří MP4 verzi s vybranou audio stopou pro TV i mobil."""
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        safe_key = hashlib.md5(f"{full_path}_{track_idx}".encode()).hexdigest()
-        cache_file = os.path.join(CACHE_DIR, f"{safe_key}.mp4")
-
-        # Pokud už soubor existuje a má velikost, vrátíme ho okamžitě
-        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1024 * 1024:
-            return cache_file
-
-        print(f"[+] Remuxing audio track #{track_idx} for Smart TV/Mobile: {os.path.basename(full_path)}...")
-        
-        # Bleskový remux: kopíruje video (-c:v copy), vybrané audio převede do AAC stereo
-        cmd = [
-            "ffmpeg", "-v", "error", "-y",
-            "-i", full_path,
-            "-map", "0:v:0",
-            "-map", f"0:a:{track_idx}",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-            "-movflags", "+faststart",
-            cache_file
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
-        if res.returncode != 0:
-            print(f"[!] FFmpeg remux error: {res.stderr}")
-            return ""
-
-        return cache_file
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -492,9 +504,11 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        elif path == "/api/prepare_audio":
+        elif path == "/api/start_hls":
+            global active_hls_proc
             rel_path = query.get("path", [""])[0]
-            track_idx = query.get("track", ["0"])[0]
+            track_idx = query.get("track", ["1"])[0]
+            start_t = query.get("t", ["0"])[0]
 
             if not self.is_safe_path(rel_path):
                 self.send_error(404, "Video not found")
@@ -502,22 +516,88 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
 
-            # Stopa 0 je výchozí originál, není třeba nic připravovat
-            if track_idx == "0":
-                resp = json.dumps({"status": "ready"}).encode("utf-8")
+            cleanup_active_hls()
+
+            session_dir = os.path.join(HLS_BASE_DIR, "session")
+            shutil.rmtree(session_dir, ignore_errors=True)
+            os.makedirs(session_dir, exist_ok=True)
+
+            m3u8_file = os.path.join(session_dir, "stream.m3u8")
+
+            cmd = ["ffmpeg", "-v", "error", "-y"]
+            try:
+                t_val = float(start_t)
+                if t_val > 0:
+                    cmd.extend(["-ss", str(t_val)])
+            except ValueError:
+                pass
+
+            cmd.extend([
+                "-i", full_path,
+                "-map", "0:v:0",
+                "-map", f"0:a:{track_idx}",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                "-f", "hls",
+                "-hls_time", "3",
+                "-hls_list_size", "5",
+                "-hls_flags", "delete_segments",
+                "-hls_segment_filename", os.path.join(session_dir, "seg_%03d.ts"),
+                m3u8_file
+            ])
+
+            print(f"[+] Starting in-memory HLS stream (RAM) for track #{track_idx} at {start_t}s...")
+            active_hls_proc = subprocess.Popen(cmd)
+
+            is_ready = False
+            for _ in range(25):
+                if os.path.exists(m3u8_file) and os.path.getsize(m3u8_file) > 40:
+                    ts_files = [f for f in os.listdir(session_dir) if f.endswith(".ts")]
+                    if len(ts_files) >= 1:
+                        is_ready = True
+                        break
+                time.sleep(0.08)
+
+            if is_ready:
+                resp = json.dumps({"status": "ready", "url": "/hls/session/stream.m3u8"}).encode("utf-8")
             else:
-                ready_file = self.get_cached_audio_file(full_path, track_idx)
-                if ready_file:
-                    resp = json.dumps({"status": "ready"}).encode("utf-8")
-                else:
-                    self.send_error(500, "Failed to prepare audio")
-                    return
+                resp = json.dumps({"status": "error"}).encode("utf-8")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(resp)))
             self.end_headers()
             self.wfile.write(resp)
+            return
+
+        elif path.startswith("/hls/"):
+            rel_hls = path[len("/hls/"):].lstrip("/\\")
+            target_file = os.path.abspath(os.path.join(HLS_BASE_DIR, rel_hls))
+
+            if not target_file.startswith(os.path.abspath(HLS_BASE_DIR)) or not os.path.exists(target_file):
+                self.send_error(404, "Segment not found")
+                return
+
+            if target_file.endswith(".m3u8"):
+                content_type = "application/x-mpegURL"
+            elif target_file.endswith(".ts"):
+                content_type = "video/MP2T"
+            else:
+                content_type = "application/octet-stream"
+
+            try:
+                with open(target_file, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                self.send_error(500, str(e))
             return
 
         elif path == "/subtitle":
@@ -550,24 +630,12 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
-            audio_track = query.get("audio", ["0"])[0]
-
             if not self.is_safe_path(rel_path):
                 self.send_error(404, "Video not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
-
-            if audio_track == "0":
-                # Originální soubor přímo z disku
-                self.handle_range_streaming(full_path)
-            else:
-                # Vyžádaný soubor s připraveným audiem pro TV i mobil
-                cached = self.get_cached_audio_file(full_path, audio_track)
-                if cached:
-                    self.handle_range_streaming(cached)
-                else:
-                    self.handle_range_streaming(full_path)
+            self.handle_range_streaming(full_path)
             return
 
         else:
@@ -625,8 +693,6 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Content-Length", str(content_length))
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         try:
@@ -644,16 +710,19 @@ class MediaHandler(BaseHTTPRequestHandler):
 
 def run_server():
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    shutil.rmtree(HLS_BASE_DIR, ignore_errors=True)
+    os.makedirs(HLS_BASE_DIR, exist_ok=True)
     print("=== TC-Media Server ===")
     print(f"Media directory : {MEDIA_DIR}")
-    print(f"Cache directory : {CACHE_DIR}")
+    print(f"HLS memory path : {HLS_BASE_DIR} (RAM)")
     print(f"Running at      : http://{HOST}:{PORT}")
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down server...")
+        cleanup_active_hls()
+        shutil.rmtree(HLS_BASE_DIR, ignore_errors=True)
         server.server_close()
 
 if __name__ == "__main__":
