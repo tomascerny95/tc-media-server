@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 TC-Media Server - Televize Library & Video.js Player.
-- Detekce všech titulků ve složce videa a jejich vložení jako <track> stopy.
-- Detekce všech zvukových stop přes ffprobe a přepínání audia (CZ / EN / ...) přímo v přehrávači.
-- Odstraněn falešný přepínač kvality (Direct Play originálního souboru).
-- HTTP 206 Range streaming pro výchozí stopu + lehký ffmpeg remux pro alternativní stopy.
+- Detekce všech titulků ve složce videa a vložení jako <track> stopy.
+- Detekce zvukových stop přes ffprobe (Čeština, Angličtina...).
+- Plynulé přepínání audia bez 10s limitu se zachováním plné délky a HTTP 206 seekování.
+- Odstraněn falešný přepínač kvality.
 - Automatická konverze SRT -> WebVTT.
 """
 import os
@@ -12,6 +12,7 @@ import sys
 import re
 import json
 import shutil
+import hashlib
 import subprocess
 import mimetypes
 import urllib.parse
@@ -22,6 +23,7 @@ HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.html")
+AUDIO_CACHE_DIR = "/tmp/tc_audio_cache"
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
@@ -45,6 +47,7 @@ mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/webm", ".webm")
 mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
+mimetypes.add_type("audio/mp4", ".m4a")
 mimetypes.add_type("text/vtt", ".vtt")
 
 FAVICON_BASE64 = (
@@ -80,13 +83,12 @@ LIBRARY_HTML = """<!DOCTYPE html>
         .url-form button:hover { background: #c93a3a; }
         .video-list { text-align: center; }
         .video-item { display: inline-flex; flex-direction: column; vertical-align: top; width: 220px; min-height: 235px; margin: 12px; text-align: left; background: #232933; border: 1px solid #3a414c; border-radius: 8px; overflow: hidden; text-decoration: none; color: inherit; transition: transform 0.15s, border-color 0.15s; }
-        .video-item:hover { transform: translateY(-3px); border-color: #e54c4c; }
+        .video-item:hover .play-link { background: #e54c4c; color: #fff; }
         .video-thumbnail { width: 100%; height: 120px; background: #14171d; display: block; }
         .video-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
         .video-details { padding: 12px; flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; }
         .video-details p { margin: 0 0 10px 0; font-weight: 500; font-size: 0.9rem; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
         .play-link { display: inline-block; text-align: center; border: 1px solid #e54c4c; color: #e54c4c; padding: 6px 14px; border-radius: 4px; text-decoration: none; font-size: 0.85rem; font-weight: 600; margin-top: auto; }
-        .video-item:hover .play-link { background: #e54c4c; color: #fff; }
         .loading { text-align: center; color: #888; margin: 30px 0; }
     </style>
 </head>
@@ -162,7 +164,6 @@ LIBRARY_HTML = """<!DOCTYPE html>
 """
 
 def get_buffer_content() -> str:
-    """Načte přesný obsah souboru buffer.html, pokud existuje."""
     if os.path.exists(BUFFER_FILE):
         try:
             with open(BUFFER_FILE, "r", encoding="utf-8") as f:
@@ -172,7 +173,6 @@ def get_buffer_content() -> str:
     return ""
 
 def find_subtitles_in_dir(video_rel_path: str):
-    """Najde všechny titulky ve stejné složce, kde leží dané video."""
     video_full_path = os.path.join(MEDIA_DIR, video_rel_path.lstrip("/\\"))
     folder = os.path.dirname(video_full_path)
     video_base = os.path.splitext(os.path.basename(video_full_path))[0].lower()
@@ -200,7 +200,6 @@ def find_subtitles_in_dir(video_rel_path: str):
     return subtitles
 
 def get_audio_tracks(video_rel_path: str):
-    """Zjistí dostupné zvukové stopy pomocí ffprobe."""
     if not shutil.which("ffprobe"):
         return []
 
@@ -255,7 +254,6 @@ def build_player_page(video_path: str) -> str:
     file_name = os.path.basename(video_path) if video_path else "Přehrávač"
     stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
 
-    # Vyhledání všech titulků ve složce videa
     track_tags = []
     if video_path:
         subs = find_subtitles_in_dir(video_path)
@@ -280,10 +278,13 @@ def build_player_page(video_path: str) -> str:
 {tracks_html}
 \t\t<p class="vjs-no-js">Chcete-li zobrazit toto video, povolte JavaScript.</p>
 \t</video>
+\t<audio id="altAudio" preload="auto" style="display:none;"></audio>
 \t<script>
 \t\tvar audioTracksData = {audio_tracks_json};
 \t\tvar currentAudioId = "0";
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
+\t\tvar altAudio = document.getElementById('altAudio');
+\t\tvar isAltAudio = false;
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
@@ -304,14 +305,45 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\tseekSeconds: 10,
 \t\t\t\t\t\ttapTimeout: 300,
 \t\t\t\t\t\tdisableOnEnd: false,
-\t\t\t\t\t\tdisabled: false,
+\t\t\t\t\t\tdisabled: false
 \t\t\t\t\t}}
 \t\t\t\t}}
 \t\t\t}}
 \t\t}}, function() {{
 \t\t\tvar p = this;
+\t\t\tvar rawVideo = p.el().querySelector('video');
 
-\t\t\t// Pokud má video více audio stop, přidáme je do přehrávače
+\t\t\t// Synchronizace stavu mezi videem a alternativním audiem
+\t\t\tp.on('play', function() {{ if (isAltAudio) altAudio.play(); }});
+\t\t\tp.on('pause', function() {{ if (isAltAudio) altAudio.pause(); }});
+\t\t\tp.on('seeking', function() {{ if (isAltAudio) altAudio.currentTime = p.currentTime(); }});
+\t\t\tp.on('seeked', function() {{
+\t\t\t\tif (isAltAudio) {{
+\t\t\t\t\taltAudio.currentTime = p.currentTime();
+\t\t\t\t\tif (!p.paused()) altAudio.play();
+\t\t\t\t}}
+\t\t\t}});
+\t\t\tp.on('volumechange', function() {{
+\t\t\t\tif (isAltAudio) {{
+\t\t\t\t\taltAudio.volume = p.volume();
+\t\t\t\t\taltAudio.muted = p.muted();
+\t\t\t\t}}
+\t\t\t}});
+\t\t\tp.on('ratechange', function() {{
+\t\t\t\tif (isAltAudio) altAudio.playbackRate = p.playbackRate();
+\t\t\t}});
+
+\t\t\t// Průběžná automatická oprava případného zpoždění zvuku
+\t\t\tsetInterval(function() {{
+\t\t\t\tif (isAltAudio && !p.paused() && !altAudio.paused) {{
+\t\t\t\t\tvar diff = Math.abs(altAudio.currentTime - p.currentTime());
+\t\t\t\t\tif (diff > 0.25) {{
+\t\t\t\t\t\taltAudio.currentTime = p.currentTime();
+\t\t\t\t\t}}
+\t\t\t\t}}
+\t\t\t}}, 2000);
+
+\t\t\t// Přidání zvukových stop do Video.js
 \t\t\tif (audioTracksData.length > 1) {{
 \t\t\t\taudioTracksData.forEach(function(t) {{
 \t\t\t\t\tp.audioTracks().addTrack(new videojs.AudioTrack({{
@@ -323,21 +355,27 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t}}));
 \t\t\t\t}});
 
-\t\t\t\t// Reakce na kliknutí na jinou zvukovou stopu v liště Video.js
 \t\t\t\tp.audioTracks().addEventListener('change', function() {{
 \t\t\t\t\tfor (var i = 0; i < p.audioTracks().length; i++) {{
 \t\t\t\t\t\tvar tr = p.audioTracks()[i];
 \t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
 \t\t\t\t\t\t\tcurrentAudioId = tr.id;
-\t\t\t\t\t\t\tvar curTime = p.currentTime();
-\t\t\t\t\t\t\tvar isPaused = p.paused();
-\t\t\t\t\t\t\tvar newSrc = '/stream?path=' + basePath + '&audio=' + tr.id;
-
-\t\t\t\t\t\t\tp.src({{ src: newSrc, type: 'video/mp4' }});
-\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
-\t\t\t\t\t\t\t\tp.currentTime(curTime);
-\t\t\t\t\t\t\t\tif (!isPaused) p.play();
-\t\t\t\t\t\t\t}});
+\t\t\t\t\t\t\tif (tr.id === "0") {{
+\t\t\t\t\t\t\t\t// Zpět na výchozí stopu v originálním videu
+\t\t\t\t\t\t\t\tisAltAudio = false;
+\t\t\t\t\t\t\t\taltAudio.pause();
+\t\t\t\t\t\t\t\taltAudio.src = "";
+\t\t\t\t\t\t\t\trawVideo.muted = false;
+\t\t\t\t\t\t\t}} else {{
+\t\t\t\t\t\t\t\t// Přepnutí na alternativní stopu (např. AJ)
+\t\t\t\t\t\t\t\tisAltAudio = true;
+\t\t\t\t\t\t\t\trawVideo.muted = true;
+\t\t\t\t\t\t\t\taltAudio.src = '/audio?path=' + basePath + '&track=' + tr.id;
+\t\t\t\t\t\t\t\taltAudio.volume = p.volume();
+\t\t\t\t\t\t\t\taltAudio.muted = p.muted();
+\t\t\t\t\t\t\t\taltAudio.currentTime = p.currentTime();
+\t\t\t\t\t\t\t\tif (!p.paused()) altAudio.play();
+\t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
 \t\t\t\t\t\t}}
 \t\t\t\t\t}}
@@ -464,19 +502,44 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
-            audio_track = query.get("audio", ["0"])[0]
-
             if not self.is_safe_path(rel_path):
                 self.send_error(404, "Video nenalezeno")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
+            self.handle_range_streaming(full_path)
+            return
 
-            # Stopa 0 se streamuje přímo z disku (rychlost, plynulé přetáčení)
-            if audio_track == "0":
-                self.handle_range_streaming(full_path)
-            else:
-                self.handle_ffmpeg_streaming(full_path, audio_track)
+        elif path == "/audio":
+            rel_path = query.get("path", [""])[0]
+            track_idx = query.get("track", ["1"])[0]
+
+            if not self.is_safe_path(rel_path):
+                self.send_error(404, "Audio nenalezeno")
+                return
+
+            full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
+            os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+
+            safe_key = hashlib.md5(f"{full_path}_{track_idx}".encode()).hexdigest()
+            cache_file = os.path.join(AUDIO_CACHE_DIR, f"{safe_key}.m4a")
+
+            # Pokud stopa ještě není vyextrahována, ffmpeg ji během 1-2 vteřin vytáhne do AAC
+            if not os.path.exists(cache_file) or os.path.getsize(cache_file) == 0:
+                cmd = [
+                    "ffmpeg", "-v", "error", "-y",
+                    "-i", full_path,
+                    "-map", f"0:a:{track_idx}",
+                    "-c:a", "aac", "-b:a", "192k",
+                    cache_file
+                ]
+                try:
+                    subprocess.run(cmd, check=True, timeout=60)
+                except Exception as e:
+                    self.send_error(500, f"Chyba při extrakci audia: {e}")
+                    return
+
+            self.handle_range_streaming(cache_file)
             return
 
         else:
@@ -486,7 +549,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         try:
             file_size = os.path.getsize(file_path)
         except OSError:
-            self.send_error(404, "Video nenalezeno")
+            self.send_error(404, "Soubor nenalezen")
             return
 
         mime_type, _ = mimetypes.guess_type(file_path)
@@ -548,47 +611,11 @@ class MediaHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def handle_ffmpeg_streaming(self, file_path: str, audio_track_idx: str):
-        """Bleskový remux vybrané audio stopy přes ffmpeg bez rekomprese obrazu."""
-        cmd = [
-            "ffmpeg", "-v", "error",
-            "-i", file_path,
-            "-map", "0:v:0",
-            "-map", f"0:a:{audio_track_idx}",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-            "-f", "mp4",
-            "pipe:1"
-        ]
-        proc = None
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-
-            while True:
-                chunk = proc.stdout.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            if proc:
-                try:
-                    proc.kill()
-                    proc.wait()
-                except Exception:
-                    pass
-
 def run_server():
     os.makedirs(MEDIA_DIR, exist_ok=True)
+    os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
     print("=== TC-Media Server ===")
     print(f"Složka médií : {MEDIA_DIR}")
-    print(f"Buffer soubor: {BUFFER_FILE}")
     print(f"Běží na      : http://{HOST}:{PORT}")
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
