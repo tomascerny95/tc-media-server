@@ -3,9 +3,10 @@
 TC-Media Server - Media Library & Video.js Player.
 - Automated detection of subtitles and audio tracks.
 - Direct Play (HTTP 206) for default audio tracks.
-- Ultra-fast in-memory HLS streaming for secondary audio tracks (EAC3->AAC):
+- Ultra-fast HLS streaming for secondary audio tracks (EAC3->AAC):
   Atomic segment creation (temp_file flag prevents corrupt partial reads),
   zero SD card wear (RAM disk via /dev/shm), 100% compatible with Smart TVs & Mobile.
+- Clean Video.js configuration without blocking native video tracks or CORS locks.
 """
 import os
 import sys
@@ -310,8 +311,8 @@ def build_player_page(video_path: str) -> str:
 </head>
 {buffer_inject}<body>
 \t<div id="tv-spinner">Starting stream...</div>
-\t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto" crossorigin="anonymous">
-\t\t<source src="{stream_url}" type="video/mp4">
+\t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto">
+\t\t<source src="{stream_url}">
 {tracks_html}
 \t\t<p class="vjs-no-js">To view this video please enable JavaScript.</p>
 \t</video>
@@ -324,13 +325,6 @@ def build_player_page(video_path: str) -> str:
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
-\t\t\thtml5: {{
-\t\t\t\tvhs: {{
-\t\t\t\t\toverrideNative: false
-\t\t\t\t}},
-\t\t\t\tnativeAudioTracks: false,
-\t\t\t\tnativeVideoTracks: false
-\t\t\t}},
 \t\t\tcontrolBar: {{
 \t\t\t\taudioTrackButton: true
 \t\t\t}},
@@ -376,8 +370,7 @@ def build_player_page(video_path: str) -> str:
 
 \t\t\t\t\t\t\tif (tr.id === "0") {{
 \t\t\t\t\t\t\t\t// Return to default track (Czech) - Direct Play
-\t\t\t\t\t\t\t\tp.reset();
-\t\t\t\t\t\t\t\tp.src({{ src: '/stream?path=' + basePath, type: 'video/mp4' }});
+\t\t\t\t\t\t\t\tp.src({{ src: '/stream?path=' + basePath }});
 \t\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
 \t\t\t\t\t\t\t\t\tp.currentTime(savedTime);
 \t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
@@ -392,7 +385,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
 \t\t\t\t\t\t\t\t\t\tisSwitching = false;
 \t\t\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
-\t\t\t\t\t\t\t\t\t\t\tp.reset();
 \t\t\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
 \t\t\t\t\t\t\t\t\t\t\tp.play();
 \t\t\t\t\t\t\t\t\t\t}} else {{
@@ -417,7 +409,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
 \t\t\t\t\t\t\t.then(function(data) {{
 \t\t\t\t\t\t\t\tif (data.status === 'ready') {{
-\t\t\t\t\t\t\t\t\tp.reset();
 \t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
 \t\t\t\t\t\t\t\t\tp.play();
 \t\t\t\t\t\t\t\t}}
@@ -544,7 +535,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
-            # Klíčový parametr: temp_file zajistí, že se segment zveřejní až jako 100% hotový
             cmd.extend([
                 "-i", full_path,
                 "-map", "0:v:0",
@@ -570,18 +560,16 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             is_ready = False
             error_msg = ""
-            for _ in range(300):  # Až 30 sekund strop pro otevření velkých souborů
+            for _ in range(300):
                 if active_hls_proc.poll() is not None:
                     error_msg = active_hls_proc.stderr.read()
                     print(f"[!] FFmpeg error: {error_msg}")
                     break
 
-                # Kontrolujeme, že je hotový playlist a existuje reálný dílek (nikoli nehotový .tmp!)
                 if os.path.exists(m3u8_file) and os.path.getsize(m3u8_file) > 20:
                     ts_files = [f for f in os.listdir(session_dir) if f.endswith(".ts") and not f.endswith(".tmp")]
                     if len(ts_files) >= 1:
                         first_ts = os.path.join(session_dir, ts_files[0])
-                        # Ověříme, že dílek už má reálnou velikost (nejen 45 kB!)
                         if os.path.getsize(first_ts) > 100 * 1024:
                             is_ready = True
                             break
@@ -608,7 +596,6 @@ class MediaHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Segment not found")
                 return
 
-            # Zamezíme odesílání nehotových dočasných dílků
             if target_file.endswith(".tmp"):
                 self.send_error(404, "Segment still writing")
                 return
@@ -727,6 +714,8 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         try:
