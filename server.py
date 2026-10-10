@@ -2,18 +2,15 @@
 """
 TC-Media Server - Televize Library & Video.js Player.
 - Detekce všech titulků ve složce videa a vložení jako <track> stopy.
-- Detekce zvukových stop přes ffprobe (Čeština, Angličtina...).
-- Plynulé přepínání audia se synchronizací a zamezením prosakování výchozího zvuku.
-- Odstraněn falešný přepínač kvality.
-- Automatická konverze SRT -> WebVTT.
+- Detekce zvukových stop přes ffprobe (Čeština [aac], Angličtina [eac3]...).
+- Živý on-the-fly streaming audia: automatický převod nepodporovaných kodeků (EAC3, AC3, DTS) do AAC.
+- Plynulá synchronizace a okamžité seekování bez čekání.
 """
 import os
 import sys
 import re
 import json
 import shutil
-import hashlib
-import tempfile
 import subprocess
 import mimetypes
 import urllib.parse
@@ -24,7 +21,6 @@ HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.html")
-AUDIO_CACHE_DIR = os.path.join(tempfile.gettempdir(), "tc_audio_cache")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
@@ -48,7 +44,7 @@ mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/webm", ".webm")
 mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
-mimetypes.add_type("audio/mp4", ".m4a")
+mimetypes.add_type("audio/aac", ".aac")
 mimetypes.add_type("text/vtt", ".vtt")
 
 FAVICON_BASE64 = (
@@ -280,7 +276,7 @@ def build_player_page(video_path: str) -> str:
 {tracks_html}
 \t\t<p class="vjs-no-js">Chcete-li zobrazit toto video, povolte JavaScript.</p>
 \t</video>
-\t<audio id="altAudio" preload="auto" style="display:none;"></audio>
+\t<audio id="altAudio" preload="none" style="display:none;"></audio>
 \t<script>
 \t\tvar audioTracksData = {audio_tracks_json};
 \t\tvar currentAudioId = "0";
@@ -323,14 +319,30 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}}
 \t\t\t}}
 
+\t\t\tfunction startAltAudioStream(seekTime) {{
+\t\t\t\tif (!isAltAudio) return;
+\t\t\t\tvar t = Math.max(0, seekTime || p.currentTime() || 0);
+\t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + t;
+\t\t\t\taltAudio.volume = p.volume();
+\t\t\t\taltAudio.muted = p.muted();
+\t\t\t\taltAudio.load();
+\t\t\t\tif (!p.paused()) {{
+\t\t\t\t\taltAudio.play().catch(function(e){{}});
+\t\t\t\t}}
+\t\t\t}}
+
 \t\t\tp.on('volumechange', function() {{
 \t\t\t\tenforceState();
 \t\t\t}});
 
 \t\t\tp.on('play', function() {{
 \t\t\t\tenforceState();
-\t\t\t\tif (isAltAudio && altAudio.src) {{
-\t\t\t\t\taltAudio.play().catch(function(e){{ console.log(e); }});
+\t\t\t\tif (isAltAudio) {{
+\t\t\t\t\tif (!altAudio.src || altAudio.src === '') {{
+\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
+\t\t\t\t\t}} else {{
+\t\t\t\t\t\taltAudio.play().catch(function(e){{}});
+\t\t\t\t\t}}
 \t\t\t\t}}
 \t\t\t}});
 
@@ -338,35 +350,17 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\tif (isAltAudio) altAudio.pause();
 \t\t\t}});
 
-\t\t\tp.on('seeking', function() {{
-\t\t\t\tenforceState();
-\t\t\t\tif (isAltAudio && altAudio.src) {{
-\t\t\t\t\taltAudio.currentTime = p.currentTime();
-\t\t\t\t}}
-\t\t\t}});
-
 \t\t\tp.on('seeked', function() {{
 \t\t\t\tenforceState();
-\t\t\t\tif (isAltAudio && altAudio.src) {{
-\t\t\t\t\taltAudio.currentTime = p.currentTime();
-\t\t\t\t\tif (!p.paused()) altAudio.play().catch(function(e){{}});
+\t\t\t\tif (isAltAudio) {{
+\t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t}}
 \t\t\t}});
 
-\t\t\tp.on('ratechange', function() {{
-\t\t\t\tif (isAltAudio) altAudio.playbackRate = p.playbackRate();
-\t\t\t}});
-
-\t\t\t// Kontrola synchronizace každé 2 vteřiny
+\t\t\t// Kontrola zpoždění
 \t\t\tsetInterval(function() {{
 \t\t\t\tenforceState();
-\t\t\t\tif (isAltAudio && !p.paused() && !altAudio.paused) {{
-\t\t\t\t\tvar diff = Math.abs(altAudio.currentTime - p.currentTime());
-\t\t\t\t\tif (diff > 0.3) {{
-\t\t\t\t\t\taltAudio.currentTime = p.currentTime();
-\t\t\t\t\t}}
-\t\t\t\t}}
-\t\t\t}}, 2000);
+\t\t\t}}, 1500);
 
 \t\t\t// Naplnění výběru zvukových stop do Video.js
 \t\t\tif (audioTracksData.length > 1) {{
@@ -386,27 +380,18 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
 \t\t\t\t\t\t\tcurrentAudioId = tr.id;
 \t\t\t\t\t\t\tif (tr.id === "0") {{
-\t\t\t\t\t\t\t\t// Výchozí stopa (Čeština)
+\t\t\t\t\t\t\t\t// Zpět na výchozí stopu (Čeština [aac])
 \t\t\t\t\t\t\t\tisAltAudio = false;
 \t\t\t\t\t\t\t\taltAudio.pause();
-\t\t\t\t\t\t\t\taltAudio.src = "";
+\t\t\t\t\t\t\t\taltAudio.removeAttribute('src');
+\t\t\t\t\t\t\t\taltAudio.load();
 \t\t\t\t\t\t\t\trawVideo.muted = p.muted();
 \t\t\t\t\t\t\t\trawVideo.volume = p.volume();
 \t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t// Alternativní stopa (Angličtina)
+\t\t\t\t\t\t\t\t// Přepnutí na alternativní stopu (Angličtina [eac3] -> živý AAC stream)
 \t\t\t\t\t\t\t\tisAltAudio = true;
 \t\t\t\t\t\t\t\trawVideo.muted = true;
-\t\t\t\t\t\t\t\taltAudio.src = '/audio?path=' + basePath + '&track=' + tr.id;
-\t\t\t\t\t\t\t\taltAudio.volume = p.volume();
-\t\t\t\t\t\t\t\taltAudio.muted = p.muted();
-\t\t\t\t\t\t\t\taltAudio.load();
-
-\t\t\t\t\t\t\t\taltAudio.onloadedmetadata = function() {{
-\t\t\t\t\t\t\t\t\taltAudio.currentTime = p.currentTime();
-\t\t\t\t\t\t\t\t\tif (!p.paused()) {{
-\t\t\t\t\t\t\t\t\t\taltAudio.play().catch(function(err){{ console.error(err); }});
-\t\t\t\t\t\t\t\t\t}}
-\t\t\t\t\t\t\t\t}};
+\t\t\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
 \t\t\t\t\t\t}}
@@ -542,39 +527,57 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.handle_range_streaming(full_path)
             return
 
-        elif path == "/audio":
+        elif path == "/audio_stream":
             rel_path = query.get("path", [""])[0]
             track_idx = query.get("track", ["1"])[0]
+            start_t = query.get("t", ["0"])[0]
 
             if not self.is_safe_path(rel_path):
                 self.send_error(404, "Audio nenalezeno")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
+
+            # Rychlý start od zadaného času
+            cmd = ["ffmpeg", "-v", "error"]
             try:
-                os.makedirs(AUDIO_CACHE_DIR, mode=0o777, exist_ok=True)
-            except Exception:
+                t_val = float(start_t)
+                if t_val > 0:
+                    cmd.extend(["-ss", str(t_val)])
+            except ValueError:
                 pass
 
-            safe_key = hashlib.md5(f"{full_path}_{track_idx}".encode()).hexdigest()
-            cache_file = os.path.join(AUDIO_CACHE_DIR, f"{safe_key}.m4a")
+            # Vezmeme stopu (např. EAC3) a za běhu ji pošleme jako AAC Stereo ADTS stream
+            cmd.extend([
+                "-i", full_path,
+                "-map", f"0:a:{track_idx}",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                "-f", "adts",
+                "pipe:1"
+            ])
 
-            if not os.path.exists(cache_file) or os.path.getsize(cache_file) == 0:
-                print(f"[+] Extrahuji audio stopu #{track_idx} pro: {os.path.basename(full_path)}...")
-                cmd = [
-                    "ffmpeg", "-v", "error", "-y",
-                    "-i", full_path,
-                    "-map", f"0:a:{track_idx}",
-                    "-c:a", "aac", "-b:a", "192k",
-                    cache_file
-                ]
-                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
-                if res.returncode != 0:
-                    print(f"[!] Chyba ffmpeg: {res.stderr}")
-                    self.send_error(500, f"Chyba při extrakci audia: {res.stderr}")
-                    return
+            proc = None
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/aac")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
 
-            self.handle_range_streaming(cache_file)
+                while True:
+                    chunk = proc.stdout.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                if proc:
+                    try:
+                        proc.kill()
+                        proc.wait()
+                    except Exception:
+                        pass
             return
 
         else:
@@ -587,12 +590,9 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Soubor nenalezen")
             return
 
-        if file_path.endswith(".m4a"):
-            mime_type = "audio/mp4"
-        else:
-            mime_type, _ = mimetypes.guess_type(file_path)
-            if not mime_type:
-                mime_type = "video/mp4"
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            mime_type = "video/mp4"
 
         range_header = self.headers.get("Range")
         if not range_header:
@@ -651,10 +651,6 @@ class MediaHandler(BaseHTTPRequestHandler):
 
 def run_server():
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    try:
-        os.makedirs(AUDIO_CACHE_DIR, mode=0o777, exist_ok=True)
-    except Exception:
-        pass
     print("=== TC-Media Server ===")
     print(f"Složka médií : {MEDIA_DIR}")
     print(f"Běží na      : http://{HOST}:{PORT}")
