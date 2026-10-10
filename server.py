@@ -2,15 +2,17 @@
 """
 TC-Media Server - Televize Library & Video.js Player.
 - Detekce všech titulků ve složce videa a jejich vložení jako <track> stopy.
-- Volba a přepínání titulků přímo v ovládací liště Video.js (CC menu).
-- Čisté karty v knihovně bez rozbalovacích seznamů.
-- Vložení buffer.html přesně mezi </head> a <body> bez poster obrázku.
-- HTTP 206 Range streaming a automatická konverze SRT -> WebVTT.
+- Detekce všech zvukových stop přes ffprobe a přepínání audia (CZ / EN / ...) přímo v přehrávači.
+- Odstraněn falešný přepínač kvality (Direct Play originálního souboru).
+- HTTP 206 Range streaming pro výchozí stopu + lehký ffmpeg remux pro alternativní stopy.
+- Automatická konverze SRT -> WebVTT.
 """
 import os
 import sys
 import re
 import json
+import shutil
+import subprocess
 import mimetypes
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -24,6 +26,19 @@ BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.h
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
 CHUNK_SIZE = 64 * 1024
+
+LANG_MAP = {
+    "cze": "Čeština", "ces": "Čeština", "cs": "Čeština",
+    "eng": "Angličtina", "en": "Angličtina",
+    "slo": "Slovenština", "slk": "Slovenština", "sk": "Slovenština",
+    "ger": "Němčina", "deu": "Němčina", "de": "Němčina",
+    "fre": "Francouzština", "fra": "Francouzština", "fr": "Francouzština",
+    "spa": "Španělština", "es": "Španělština",
+    "ita": "Italština", "it": "Italština",
+    "rus": "Ruština", "ru": "Ruština",
+    "jpn": "Japonština", "ja": "Japonština",
+    "und": "Nespecifikováno"
+}
 
 mimetypes.init()
 mimetypes.add_type("video/mp4", ".mp4")
@@ -48,7 +63,6 @@ THUMBNAIL_SVG = urllib.parse.quote("""<svg xmlns="http://www.w3.org/2000/svg" vi
 </svg>""")
 DEFAULT_THUMBNAIL = f"data:image/svg+xml;utf8,{THUMBNAIL_SVG}"
 
-# --- ŠABLONA KNIHOVNY ---
 LIBRARY_HTML = """<!DOCTYPE html>
 <html lang="cs">
 <head>
@@ -180,27 +194,80 @@ def find_subtitles_in_dir(video_rel_path: str):
                 "default": is_matched
             })
 
-    # Pokud žádný soubor přesně neodpovídá jménu videa, nastavíme jako výchozí první nalezený
     if subtitles and not any(s["default"] for s in subtitles):
         subtitles[0]["default"] = True
 
     return subtitles
 
+def get_audio_tracks(video_rel_path: str):
+    """Zjistí dostupné zvukové stopy pomocí ffprobe."""
+    if not shutil.which("ffprobe"):
+        return []
+
+    video_full_path = os.path.join(MEDIA_DIR, video_rel_path.lstrip("/\\"))
+    if not os.path.exists(video_full_path):
+        return []
+
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index:stream_tags=language,title:stream=codec_name",
+            "-of", "json",
+            video_full_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res.returncode != 0:
+            return []
+
+        data = json.loads(res.stdout)
+        streams = data.get("streams", [])
+        tracks = []
+
+        for i, s in enumerate(streams):
+            tags = s.get("tags") or {}
+            raw_lang = (tags.get("language") or tags.get("LANGUAGE") or "").lower()
+            title = tags.get("title") or tags.get("TITLE") or ""
+            codec = s.get("codec_name", "")
+
+            lang_label = LANG_MAP.get(raw_lang, raw_lang.upper() if raw_lang else f"Audio {i+1}")
+            if title and title.lower() != raw_lang:
+                label = f"{lang_label} ({title})"
+            else:
+                label = lang_label
+
+            if codec:
+                label += f" [{codec}]"
+
+            tracks.append({
+                "id": str(i),
+                "label": label,
+                "lang": raw_lang or "und",
+                "default": (i == 0)
+            })
+
+        return tracks
+    except Exception as e:
+        print(f"[!] Chyba při detekci audia: {e}")
+        return []
+
 def build_player_page(video_path: str) -> str:
     file_name = os.path.basename(video_path) if video_path else "Přehrávač"
     stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
 
-    # Vyhledání všech titulků ve složce videa a sestavení <track> značek
+    # Vyhledání všech titulků ve složce videa
     track_tags = []
     if video_path:
         subs = find_subtitles_in_dir(video_path)
-        for idx, s in enumerate(subs, 1):
+        for s in subs:
             sub_url = f"/subtitle?path={urllib.parse.quote(s['path'])}"
             def_attr = " default" if s["default"] else ""
             label = f"Titulky: {s['name']}"
             track_tags.append(f'\t\t<track src="{sub_url}" kind="captions" label="{label}"{def_attr} />')
 
     tracks_html = "\n".join(track_tags)
+    audio_tracks = get_audio_tracks(video_path) if video_path else []
+    audio_tracks_json = json.dumps(audio_tracks)
     buffer_inject = get_buffer_content()
 
     html = f"""<head>
@@ -208,15 +275,22 @@ def build_player_page(video_path: str) -> str:
 \t<link rel="shortcut icon" href="{FAVICON_BASE64}" />
 </head>
 {buffer_inject}<body>
-\t<video id="videoPlayer" class="video-js vjs-big-play-centered">
+\t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto">
+\t\t<source src="{stream_url}" type="video/mp4">
 {tracks_html}
-\t\t<p class="vjs-no-js">Chcete-li zobrazit toto video, povolte JavaScript a zvažte upgrade na webový prohlížeč, který <a href="https://videojs.com/html5-video-support/" target="_blank" >podporuje HTML5 video</a></p>
+\t\t<p class="vjs-no-js">Chcete-li zobrazit toto video, povolte JavaScript.</p>
 \t</video>
 \t<script>
-\t\tvideojs('videoPlayer',{{
-\t\t\t"controls" : true,
+\t\tvar audioTracksData = {audio_tracks_json};
+\t\tvar currentAudioId = "0";
+\t\tvar basePath = "{urllib.parse.quote(video_path)}";
+
+\t\tvar player = videojs('videoPlayer', {{
+\t\t\tcontrols: true,
+\t\t\tcontrolBar: {{
+\t\t\t\taudioTrackButton: true
+\t\t\t}},
 \t\t\tplugins: {{
-\t\t\t\tvideoJsResolutionSwitcher: {{}}, 
 \t\t\t\thotkeys: {{}},
 \t\t\t\tmobileUi: {{
 \t\t\t\t\tfullscreen: {{
@@ -232,31 +306,52 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\tdisableOnEnd: false,
 \t\t\t\t\t\tdisabled: false,
 \t\t\t\t\t}}
-\t\t\t\t}},
+\t\t\t\t}}
 \t\t\t}}
-\t\t}}, function(){{
-\t\t\tvar player = this;
-\t\t\tplayer.updateSrc(
-\t\t\t\t[
-\t\t\t\t\t{{
-\t\t\t\t\t\tsrc: '{stream_url}',
-\t\t\t\t\t\ttype: 'video/mp4',
-\t\t\t\t\t\tlabel: 'Kvalita: 720p - 0'
-\t\t\t\t\t}},
-\t\t\t\t]
-\t\t\t)
-\t\t}}
-\t\t);
+\t\t}}, function() {{
+\t\t\tvar p = this;
+
+\t\t\t// Pokud má video více audio stop, přidáme je do přehrávače
+\t\t\tif (audioTracksData.length > 1) {{
+\t\t\t\taudioTracksData.forEach(function(t) {{
+\t\t\t\t\tp.audioTracks().addTrack(new videojs.AudioTrack({{
+\t\t\t\t\t\tid: t.id,
+\t\t\t\t\t\tkind: 'alternative',
+\t\t\t\t\t\tlabel: t.label,
+\t\t\t\t\t\tlanguage: t.lang,
+\t\t\t\t\t\tenabled: t.default
+\t\t\t\t\t}}));
+\t\t\t\t}});
+
+\t\t\t\t// Reakce na kliknutí na jinou zvukovou stopu v liště Video.js
+\t\t\t\tp.audioTracks().addEventListener('change', function() {{
+\t\t\t\t\tfor (var i = 0; i < p.audioTracks().length; i++) {{
+\t\t\t\t\t\tvar tr = p.audioTracks()[i];
+\t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
+\t\t\t\t\t\t\tcurrentAudioId = tr.id;
+\t\t\t\t\t\t\tvar curTime = p.currentTime();
+\t\t\t\t\t\t\tvar isPaused = p.paused();
+\t\t\t\t\t\t\tvar newSrc = '/stream?path=' + basePath + '&audio=' + tr.id;
+
+\t\t\t\t\t\t\tp.src({{ src: newSrc, type: 'video/mp4' }});
+\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
+\t\t\t\t\t\t\t\tp.currentTime(curTime);
+\t\t\t\t\t\t\t\tif (!isPaused) p.play();
+\t\t\t\t\t\t\t}});
+\t\t\t\t\t\t\tbreak;
+\t\t\t\t\t\t}}
+\t\t\t\t\t}}
+\t\t\t\t}});
+\t\t\t}}
+\t\t}});
 \t</script>
 </body>"""
     return html
-
 
 def convert_srt_to_vtt(srt_text: str) -> str:
     vtt = "WEBVTT\n\n"
     converted = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', srt_text)
     return vtt + converted
-
 
 class MediaHandler(BaseHTTPRequestHandler):
 
@@ -369,12 +464,19 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
+            audio_track = query.get("audio", ["0"])[0]
+
             if not self.is_safe_path(rel_path):
                 self.send_error(404, "Video nenalezeno")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
-            self.handle_range_streaming(full_path)
+
+            # Stopa 0 se streamuje přímo z disku (rychlost, plynulé přetáčení)
+            if audio_track == "0":
+                self.handle_range_streaming(full_path)
+            else:
+                self.handle_ffmpeg_streaming(full_path, audio_track)
             return
 
         else:
@@ -446,6 +548,41 @@ class MediaHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def handle_ffmpeg_streaming(self, file_path: str, audio_track_idx: str):
+        """Bleskový remux vybrané audio stopy přes ffmpeg bez rekomprese obrazu."""
+        cmd = [
+            "ffmpeg", "-v", "error",
+            "-i", file_path,
+            "-map", "0:v:0",
+            "-map", f"0:a:{audio_track_idx}",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1"
+        ]
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            while True:
+                chunk = proc.stdout.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if proc:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
 
 def run_server():
     os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -459,7 +596,6 @@ def run_server():
     except KeyboardInterrupt:
         print("\nUkončuji server...")
         server.server_close()
-
 
 if __name__ == "__main__":
     run_server()
