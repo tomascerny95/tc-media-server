@@ -1,43 +1,43 @@
 #!/bin/bash
 # ==============================================================================
-# TC-Media Server - Instalační a konfigurační skript
-# Zahrnuje: Python 3, qBittorrent-nox a FFmpeg (ffprobe) pro Raspberry Pi / Linux
+# TC-Media Server - Installation & Setup Script
+# Features: Python 3, qBittorrent-nox, and FFmpeg (ffprobe) for Linux / Raspberry Pi
 # ==============================================================================
 
 set -e
 
-# Kontrola root práv
+# Root privilege check
 if [ "$EUID" -ne 0 ]; then
-    echo "[-] Tento skript musí být spuštěn jako root (např. sudo ./setup_tc_media.sh)"
+    echo "[-] This script must be run as root (e.g. sudo ./setup_tc_media.sh)"
     exit 1
 fi
 
-# Zjištění reálného uživatele a adresáře skriptu
+# Detect actual user and script directory
 ACTUAL_USER="${SUDO_USER:-$USER}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEDIA_DIR="/dlna"
 
 echo "=================================================="
-echo "    Instalace a nastavení TC-Media Serveru        "
+echo "         TC-Media Server Setup Script             "
 echo "=================================================="
-echo "[i] Uživatel        : ${ACTUAL_USER}"
-echo "[i] Adresář repozitáře: ${SCRIPT_DIR}"
-echo "[i] Složka médií    : ${MEDIA_DIR}"
+echo "[i] User             : ${ACTUAL_USER}"
+echo "[i] Repository path  : ${SCRIPT_DIR}"
+echo "[i] Media directory  : ${MEDIA_DIR}"
 echo "--------------------------------------------------"
 
-# 1. Instalace potřebných balíčků
-echo "[+] Aktualizuji repozitáře a instaluji balíčky (python3, qbittorrent-nox, ffmpeg)..."
+# 1. Update repositories and install required packages
+echo "[+] Updating package list and installing dependencies (python3, qbittorrent-nox, ffmpeg)..."
 apt-get update
 apt-get install -y python3 qbittorrent-nox ffmpeg
 
-# 2. Vytvoření a oprávnění pro sdílenou složku /dlna
-echo "[+] Nastavuji adresář médií ${MEDIA_DIR}..."
+# 2. Setup shared media folder (/dlna)
+echo "[+] Configuring media directory: ${MEDIA_DIR}..."
 mkdir -p "${MEDIA_DIR}"
 chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "${MEDIA_DIR}"
 chmod -R 777 "${MEDIA_DIR}"
 
-# 3. Vytvoření systemd služby pro Web Player (tc-media-player)
-echo "[+] Vytvářím systemd službu: tc-media-player.service..."
+# 3. Create systemd service for TC-Media Web Player
+echo "[+] Creating systemd service: tc-media-player.service..."
 cat <<EOF > /etc/systemd/system/tc-media-player.service
 [Unit]
 Description=TC-Media Server (Web Video Player)
@@ -55,8 +55,8 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-# 4. Vytvoření systemd služby pro qBittorrent
-echo "[+] Vytvářím systemd službu: qbittorrent.service..."
+# 4. Create systemd service for qBittorrent daemon
+echo "[+] Creating systemd service: qbittorrent.service..."
 cat <<EOF > /etc/systemd/system/qbittorrent.service
 [Unit]
 Description=qBittorrent Headless Daemon
@@ -73,8 +73,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# 5. Načtení a spuštění služeb
-echo "[+] Načítám a spouštím systemd služby..."
+# 5. Reload systemd and start services
+echo "[+] Reloading daemon and starting services..."
 systemctl daemon-reload
 
 systemctl enable tc-media-player.service
@@ -83,15 +83,15 @@ systemctl restart tc-media-player.service
 systemctl enable qbittorrent.service
 systemctl restart qbittorrent.service
 
-# 6. Zjištění lokální IP adresy
+# 6. Retrieve local IP address
 LOCAL_IP=$(hostname -I | awk '{print $1}')
 
 echo "=================================================="
-echo "          Instalace úspěšně dokončena!            "
+echo "       Installation Completed Successfully!       "
 echo "=================================================="
-echo "Webový přehrávač : http://${LOCAL_IP}:5000"
+echo "Web Video Player : http://${LOCAL_IP}:5000"
 echo "qBittorrent WebUI: http://${LOCAL_IP}:8080"
-echo "Složka pro média : ${MEDIA_DIR}"
+echo "Media directory  : ${MEDIA_DIR}"
 echo ""
-echo "Podpora audia: FFmpeg a ffprobe jsou připraveny k použití."
+echo "Audio support: FFmpeg and ffprobe are ready."
 echo "=================================================="
