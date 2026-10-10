@@ -3,7 +3,7 @@
 TC-Media Server - Televize Library & Video.js Player.
 - Detekce všech titulků ve složce videa a vložení jako <track> stopy.
 - Detekce zvukových stop přes ffprobe (Čeština, Angličtina...).
-- Plynulé přepínání audia bez 10s limitu se zachováním plné délky a HTTP 206 seekování.
+- Plynulé přepínání audia se synchronizací a zamezením prosakování výchozího zvuku.
 - Odstraněn falešný přepínač kvality.
 - Automatická konverze SRT -> WebVTT.
 """
@@ -13,6 +13,7 @@ import re
 import json
 import shutil
 import hashlib
+import tempfile
 import subprocess
 import mimetypes
 import urllib.parse
@@ -23,7 +24,7 @@ HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.html")
-AUDIO_CACHE_DIR = "/tmp/tc_audio_cache"
+AUDIO_CACHE_DIR = os.path.join(tempfile.gettempdir(), "tc_audio_cache")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
@@ -83,12 +84,13 @@ LIBRARY_HTML = """<!DOCTYPE html>
         .url-form button:hover { background: #c93a3a; }
         .video-list { text-align: center; }
         .video-item { display: inline-flex; flex-direction: column; vertical-align: top; width: 220px; min-height: 235px; margin: 12px; text-align: left; background: #232933; border: 1px solid #3a414c; border-radius: 8px; overflow: hidden; text-decoration: none; color: inherit; transition: transform 0.15s, border-color 0.15s; }
-        .video-item:hover .play-link { background: #e54c4c; color: #fff; }
+        .video-item:hover { transform: translateY(-3px); border-color: #e54c4c; }
         .video-thumbnail { width: 100%; height: 120px; background: #14171d; display: block; }
         .video-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
         .video-details { padding: 12px; flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; }
         .video-details p { margin: 0 0 10px 0; font-weight: 500; font-size: 0.9rem; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
         .play-link { display: inline-block; text-align: center; border: 1px solid #e54c4c; color: #e54c4c; padding: 6px 14px; border-radius: 4px; text-decoration: none; font-size: 0.85rem; font-weight: 600; margin-top: auto; }
+        .video-item:hover .play-link { background: #e54c4c; color: #fff; }
         .loading { text-align: center; color: #888; margin: 30px 0; }
     </style>
 </head>
@@ -313,37 +315,60 @@ def build_player_page(video_path: str) -> str:
 \t\t\tvar p = this;
 \t\t\tvar rawVideo = p.el().querySelector('video');
 
-\t\t\t// Synchronizace stavu mezi videem a alternativním audiem
-\t\t\tp.on('play', function() {{ if (isAltAudio) altAudio.play(); }});
-\t\t\tp.on('pause', function() {{ if (isAltAudio) altAudio.pause(); }});
-\t\t\tp.on('seeking', function() {{ if (isAltAudio) altAudio.currentTime = p.currentTime(); }});
-\t\t\tp.on('seeked', function() {{
+\t\t\tfunction enforceState() {{
 \t\t\t\tif (isAltAudio) {{
-\t\t\t\t\taltAudio.currentTime = p.currentTime();
-\t\t\t\t\tif (!p.paused()) altAudio.play();
-\t\t\t\t}}
-\t\t\t}});
-\t\t\tp.on('volumechange', function() {{
-\t\t\t\tif (isAltAudio) {{
+\t\t\t\t\trawVideo.muted = true;
 \t\t\t\t\taltAudio.volume = p.volume();
 \t\t\t\t\taltAudio.muted = p.muted();
 \t\t\t\t}}
+\t\t\t}}
+
+\t\t\tp.on('volumechange', function() {{
+\t\t\t\tenforceState();
 \t\t\t}});
+
+\t\t\tp.on('play', function() {{
+\t\t\t\tenforceState();
+\t\t\t\tif (isAltAudio && altAudio.src) {{
+\t\t\t\t\taltAudio.play().catch(function(e){{ console.log(e); }});
+\t\t\t\t}}
+\t\t\t}});
+
+\t\t\tp.on('pause', function() {{
+\t\t\t\tif (isAltAudio) altAudio.pause();
+\t\t\t}});
+
+\t\t\tp.on('seeking', function() {{
+\t\t\t\tenforceState();
+\t\t\t\tif (isAltAudio && altAudio.src) {{
+\t\t\t\t\taltAudio.currentTime = p.currentTime();
+\t\t\t\t}}
+\t\t\t}});
+
+\t\t\tp.on('seeked', function() {{
+\t\t\t\tenforceState();
+\t\t\t\tif (isAltAudio && altAudio.src) {{
+\t\t\t\t\taltAudio.currentTime = p.currentTime();
+\t\t\t\t\tif (!p.paused()) altAudio.play().catch(function(e){{}});
+\t\t\t\t}}
+\t\t\t}});
+
 \t\t\tp.on('ratechange', function() {{
 \t\t\t\tif (isAltAudio) altAudio.playbackRate = p.playbackRate();
 \t\t\t}});
 
-\t\t\t// Průběžná automatická oprava případného zpoždění zvuku
+\t\t\t// Kontrola synchronizace každé 2 vteřiny
 \t\t\tsetInterval(function() {{
+\t\t\t\tenforceState();
 \t\t\t\tif (isAltAudio && !p.paused() && !altAudio.paused) {{
 \t\t\t\t\tvar diff = Math.abs(altAudio.currentTime - p.currentTime());
-\t\t\t\t\tif (diff > 0.25) {{
+\t\t\t\t\tif (diff > 0.3) {{
 \t\t\t\t\t\taltAudio.currentTime = p.currentTime();
 \t\t\t\t\t}}
 \t\t\t\t}}
 \t\t\t}}, 2000);
 
-\t\t\t// Přidání zvukových stop do Video.js
+\t\t\t// Naplnění výběru zvukových stop do Video.js
 \t\t\tif (audioTracksData.length > 1) {{
 \t\t\t\taudioTracksData.forEach(function(t) {{
 \t\t\t\t\tp.audioTracks().addTrack(new videojs.AudioTrack({{
@@ -361,20 +386,27 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
 \t\t\t\t\t\t\tcurrentAudioId = tr.id;
 \t\t\t\t\t\t\tif (tr.id === "0") {{
-\t\t\t\t\t\t\t\t// Zpět na výchozí stopu v originálním videu
+\t\t\t\t\t\t\t\t// Výchozí stopa (Čeština)
 \t\t\t\t\t\t\t\tisAltAudio = false;
 \t\t\t\t\t\t\t\taltAudio.pause();
 \t\t\t\t\t\t\t\taltAudio.src = "";
-\t\t\t\t\t\t\t\trawVideo.muted = false;
+\t\t\t\t\t\t\t\trawVideo.muted = p.muted();
+\t\t\t\t\t\t\t\trawVideo.volume = p.volume();
 \t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t// Přepnutí na alternativní stopu (např. AJ)
+\t\t\t\t\t\t\t\t// Alternativní stopa (Angličtina)
 \t\t\t\t\t\t\t\tisAltAudio = true;
 \t\t\t\t\t\t\t\trawVideo.muted = true;
 \t\t\t\t\t\t\t\taltAudio.src = '/audio?path=' + basePath + '&track=' + tr.id;
 \t\t\t\t\t\t\t\taltAudio.volume = p.volume();
 \t\t\t\t\t\t\t\taltAudio.muted = p.muted();
-\t\t\t\t\t\t\t\taltAudio.currentTime = p.currentTime();
-\t\t\t\t\t\t\t\tif (!p.paused()) altAudio.play();
+\t\t\t\t\t\t\t\taltAudio.load();
+
+\t\t\t\t\t\t\t\taltAudio.onloadedmetadata = function() {{
+\t\t\t\t\t\t\t\t\taltAudio.currentTime = p.currentTime();
+\t\t\t\t\t\t\t\t\tif (!p.paused()) {{
+\t\t\t\t\t\t\t\t\t\taltAudio.play().catch(function(err){{ console.error(err); }});
+\t\t\t\t\t\t\t\t\t}}
+\t\t\t\t\t\t\t\t}};
 \t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
 \t\t\t\t\t\t}}
@@ -519,13 +551,16 @@ class MediaHandler(BaseHTTPRequestHandler):
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
-            os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+            try:
+                os.makedirs(AUDIO_CACHE_DIR, mode=0o777, exist_ok=True)
+            except Exception:
+                pass
 
             safe_key = hashlib.md5(f"{full_path}_{track_idx}".encode()).hexdigest()
             cache_file = os.path.join(AUDIO_CACHE_DIR, f"{safe_key}.m4a")
 
-            # Pokud stopa ještě není vyextrahována, ffmpeg ji během 1-2 vteřin vytáhne do AAC
             if not os.path.exists(cache_file) or os.path.getsize(cache_file) == 0:
+                print(f"[+] Extrahuji audio stopu #{track_idx} pro: {os.path.basename(full_path)}...")
                 cmd = [
                     "ffmpeg", "-v", "error", "-y",
                     "-i", full_path,
@@ -533,10 +568,10 @@ class MediaHandler(BaseHTTPRequestHandler):
                     "-c:a", "aac", "-b:a", "192k",
                     cache_file
                 ]
-                try:
-                    subprocess.run(cmd, check=True, timeout=60)
-                except Exception as e:
-                    self.send_error(500, f"Chyba při extrakci audia: {e}")
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+                if res.returncode != 0:
+                    print(f"[!] Chyba ffmpeg: {res.stderr}")
+                    self.send_error(500, f"Chyba při extrakci audia: {res.stderr}")
                     return
 
             self.handle_range_streaming(cache_file)
@@ -552,9 +587,12 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Soubor nenalezen")
             return
 
-        mime_type, _ = mimetypes.guess_type(file_path)
-        if not mime_type:
-            mime_type = "video/mp4"
+        if file_path.endswith(".m4a"):
+            mime_type = "audio/mp4"
+        else:
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if not mime_type:
+                mime_type = "video/mp4"
 
         range_header = self.headers.get("Range")
         if not range_header:
@@ -613,7 +651,10 @@ class MediaHandler(BaseHTTPRequestHandler):
 
 def run_server():
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+    try:
+        os.makedirs(AUDIO_CACHE_DIR, mode=0o777, exist_ok=True)
+    except Exception:
+        pass
     print("=== TC-Media Server ===")
     print(f"Složka médií : {MEDIA_DIR}")
     print(f"Běží na      : http://{HOST}:{PORT}")
