@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 TC-Media Server - Televize Library & Video.js Player.
-- Detekce všech titulků ve složce videa a vložení jako <track> stopy.
-- Detekce zvukových stop přes ffprobe (Čeština [aac], Angličtina [eac3]...).
-- Živý on-the-fly streaming audia s převodem EAC3/AC3 do AAC.
-- Web Audio API pro oddělení hlasitosti: žádné zacyklené MUTE.
+- Detekce titulků a zvukových stop (Čeština [aac], Angličtina [eac3]...).
+- Živý on-the-fly streaming s bleskovým převodem EAC3 -> AAC.
+- Web Audio API pro nezávislou hlasitost.
+- Automatická synchronizace zvuku s obrazem (nulové zpoždění, plynulý lip-sync).
 """
 import os
 import sys
@@ -49,7 +49,7 @@ mimetypes.add_type("text/vtt", ".vtt")
 
 FAVICON_BASE64 = (
     "data:image/x-icon;base64,AAABAAYAAAAAAAEAIADqMAAAZgAAAICAAAABACAAKAgBAFAxAABAQAAAAQAgAChCAAB4OQEAMDAAAAEAIACoJQAAoHsBACAgAA"
-    "ABACAAqBAAAEihAQAQEAAAAQAgAGgEAADwsQEAiVBORw0KGgoAAASUhEUgAAAQAAAAEACAYAAABccqhmAAAwsUlEQVR42u2dWXMkyZHf/xGRWVkXzgLQF/qY"
+    "ABACAAqBAAAEihAQAQEAAAAQAgAGgEAADwsQEAiVBORw0KGgoAAAASUhEUgAAAQAAAAEACAYAAABccqhmAAAwsUlEQVR42u2dWXMkyZHf/xGRWVkXzgLQF/qY"
     "me65umeGxyx3luRybR+l1cpMJpPpUabPJTN9BJkepBcdtmvUrkhxODyG5FzsOfpAN7objRt1ZWa4HgpAhkfWTAFVBaCA9B+NNGYhIysrD+9wD/e/K+xDRARBE"
     "AqBUkoBgD7rExEE4ewQAyAIBUYMgCAUGDEAglBgxAAIQoERAyAIBUYMgCAUmOCsT6BwuCUXRKAk4X/vdgGy2XaSglJnH0tAHPMxYcg2Vb0OVSplH2jd++9xiG"
     "N+bkkCarXcHwKkaf48VPY9yhggcB4xrfh5AYAJgF5aunAGiAE4TawFuS8vEezz53yXx4/Yi0Yb67Dr69l2pwP79Ckbo69cYS9R+NO/hrl+/XBblctQtfrxTvXF"
@@ -284,6 +284,7 @@ def build_player_page(video_path: str) -> str:
 \t\tvar altAudio = document.getElementById('altAudio');
 \t\tvar isAltAudio = false;
 
+\t\tvar altAudioBaseTime = 0;
 \t\tvar audioCtx = null;
 \t\tvar videoGain = null;
 
@@ -314,7 +315,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\tvar p = this;
 \t\t\tvar rawVideo = p.el().querySelector('video');
 
-\t\t\t// Inicializace WebAudio uzlu pro umlčení videa bez zásahu do MUTE stavu
 \t\t\tfunction ensureAudioGraph() {{
 \t\t\t\tif (!audioCtx) {{
 \t\t\t\t\ttry {{
@@ -344,14 +344,32 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\tif (!isAltAudio) return;
 \t\t\t\tensureAudioGraph();
 \t\t\t\tupdateLevels();
-\t\t\t\tvar t = Math.max(0, seekTime !== undefined ? seekTime : (p.currentTime() || 0));
-\t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + t;
+
+\t\t\t\tvar targetTime = Math.max(0, seekTime !== undefined ? seekTime : (p.currentTime() || 0));
+\t\t\t\taltAudioBaseTime = targetTime;
+
+\t\t\t\tvar wasPlaying = !p.paused();
+\t\t\t\t// Pozastavíme video, než se zvuk reálně spustí, aby video neuteklo napřed
+\t\t\t\tif (wasPlaying) {{
+\t\t\t\t\tp.pause();
+\t\t\t\t}}
+
+\t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + targetTime;
 \t\t\t\taltAudio.volume = p.volume();
 \t\t\t\taltAudio.muted = p.muted();
 \t\t\t\taltAudio.load();
-\t\t\t\tif (!p.paused()) {{
-\t\t\t\t\taltAudio.play().catch(function(e){{}});
-\t\t\t\t}}
+
+\t\t\t\tvar onAudioReady = function() {{
+\t\t\t\t\taltAudio.removeEventListener('playing', onAudioReady);
+\t\t\t\t\t// Jakmile zvuk začne reálně hrát, srovnáme video a pustíme ho současně
+\t\t\t\t\tp.currentTime(targetTime);
+\t\t\t\t\tif (wasPlaying) {{
+\t\t\t\t\t\tp.play().catch(function(e){{}});
+\t\t\t\t\t}}
+\t\t\t\t}};
+
+\t\t\t\taltAudio.addEventListener('playing', onAudioReady, {{ once: true }});
+\t\t\t\taltAudio.play().catch(function(e){{}});
 \t\t\t}}
 
 \t\t\tp.on('volumechange', function() {{
@@ -380,6 +398,32 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}}
 \t\t\t}});
 
+\t\t\t// Automatické jemné dorovnávání zvuku (Lip-Sync) za běhu
+\t\t\tsetInterval(function() {{
+\t\t\t\tif (!isAltAudio || p.paused() || altAudio.paused || altAudio.readyState < 2) return;
+
+\t\t\t\tvar currentAudioTime = altAudioBaseTime + altAudio.currentTime;
+\t\t\t\tvar currentVideoTime = p.currentTime();
+\t\t\t\tvar diff = currentVideoTime - currentAudioTime;
+
+\t\t\t\t// Rozdíl do 80ms je lidským okem nepostřehnutelný
+\t\t\t\tif (Math.abs(diff) < 0.08) {{
+\t\t\t\t\taltAudio.playbackRate = p.playbackRate();
+\t\t\t\t}}
+\t\t\t\t// Pokud je video mírně napřed, zvuk neznatelně zrychlíme o 5 %, aby video dohnal
+\t\t\t\telse if (diff > 0.08 && diff < 0.5) {{
+\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 1.05;
+\t\t\t\t}}
+\t\t\t\t// Pokud je zvuk napřed, mírně ho zpomalíme
+\t\t\t\telse if (diff < -0.08 && diff > -0.5) {{
+\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 0.95;
+\t\t\t\t}}
+\t\t\t\t// Pokud došlo k většímu rozhození (např. lag sítě > 0.5s), srovnáme video přímo
+\t\t\t\telse if (Math.abs(diff) >= 0.5) {{
+\t\t\t\t\tp.currentTime(currentAudioTime);
+\t\t\t\t}}
+\t\t\t}}, 500);
+
 \t\t\t// Naplnění výběru zvukových stop do Video.js
 \t\t\tif (audioTracksData.length > 1) {{
 \t\t\t\taudioTracksData.forEach(function(t) {{
@@ -405,7 +449,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t\taltAudio.removeAttribute('src');
 \t\t\t\t\t\t\t\tupdateLevels();
 \t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t// Angličtina [eac3 -> živý AAC stream]
+\t\t\t\t\t\t\t\t// Angličtina [eac3]
 \t\t\t\t\t\t\t\tisAltAudio = true;
 \t\t\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t\t\t\t}}
@@ -554,11 +598,12 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
 
+            # Rychlý a přesný skok ve ffmpeg bez ukládání do vyrovnávací paměti
             cmd = ["ffmpeg", "-v", "error"]
             try:
                 t_val = float(start_t)
                 if t_val > 0:
-                    cmd.extend(["-ss", str(t_val)])
+                    cmd.extend(["-accurate_seek", "-ss", str(t_val)])
             except ValueError:
                 pass
 
@@ -566,6 +611,8 @@ class MediaHandler(BaseHTTPRequestHandler):
                 "-i", full_path,
                 "-map", f"0:a:{track_idx}",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                "-flush_packets", "1",
+                "-muxdelay", "0",
                 "-f", "adts",
                 "pipe:1"
             ])
