@@ -4,9 +4,8 @@ TC-Media Server - Media Library & Video.js Player.
 - Automated detection of subtitles and audio tracks.
 - Direct Play (HTTP 206) for default audio tracks.
 - Ultra-fast in-memory HLS streaming for secondary audio tracks (EAC3->AAC):
-  Atomic segment creation (temp_file flag prevents corrupt partial reads),
+  Normalized PTS timestamps (avoids PTS gaps when switching mid-movie),
   zero SD card wear (RAM disk via /dev/shm), 100% compatible with Smart TVs & Mobile.
-- Unblocked ffmpeg process pipeline (fixed stderr buffer deadlock).
 """
 import os
 import sys
@@ -321,7 +320,6 @@ def build_player_page(video_path: str) -> str:
 \t\tvar currentAudioId = "0";
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
 \t\tvar spinner = document.getElementById('tv-spinner');
-\t\tvar isSwitching = false;
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
@@ -349,6 +347,25 @@ def build_player_page(video_path: str) -> str:
 \t\t}}, function() {{
 \t\t\tvar p = this;
 
+\t\t\tfunction loadHlsStream(startTime) {{
+\t\t\t\tspinner.style.display = 'block';
+\t\t\t\tfetch('/api/start_hls?path=' + basePath + '&track=' + currentAudioId + '&t=' + Math.floor(startTime))
+\t\t\t\t\t.then(function(res) {{ return res.json(); }})
+\t\t\t\t\t.then(function(data) {{
+\t\t\t\t\t\tspinner.style.display = 'none';
+\t\t\t\t\t\tif (data.status === 'ready') {{
+\t\t\t\t\t\t\tp.src({{ src: data.url + '?v=' + Date.now(), type: 'application/x-mpegURL' }});
+\t\t\t\t\t\t\tp.play().catch(function(e){{}});
+\t\t\t\t\t\t}} else {{
+\t\t\t\t\t\t\talert('Stream error: ' + (data.message || 'Unknown error'));
+\t\t\t\t\t\t}}
+\t\t\t\t\t}})
+\t\t\t\t\t.catch(function(err) {{
+\t\t\t\t\t\tspinner.style.display = 'none';
+\t\t\t\t\t\talert('Error loading stream: ' + err);
+\t\t\t\t\t}});
+\t\t\t}}
+
 \t\t\tif (audioTracksData.length > 1) {{
 \t\t\t\taudioTracksData.forEach(function(t) {{
 \t\t\t\t\tp.audioTracks().addTrack(new videojs.AudioTrack({{
@@ -369,50 +386,18 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\tvar wasPaused = p.paused();
 
 \t\t\t\t\t\t\tif (tr.id === "0") {{
-\t\t\t\t\t\t\t\t// Return to default track (Czech) - Direct Play
+\t\t\t\t\t\t\t\t// Zpět na výchozí stopu (Čeština) - Direct Play
 \t\t\t\t\t\t\t\tp.src({{ src: '/stream?path=' + basePath }});
 \t\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
 \t\t\t\t\t\t\t\t\tp.currentTime(savedTime);
 \t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
 \t\t\t\t\t\t\t\t}});
 \t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t// Secondary track (English EAC3) - Instant HLS stream from RAM
-\t\t\t\t\t\t\t\tspinner.style.display = 'block';
-\t\t\t\t\t\t\t\tisSwitching = true;
-\t\t\t\t\t\t\t\tfetch('/api/start_hls?path=' + basePath + '&track=' + tr.id + '&t=' + savedTime)
-\t\t\t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
-\t\t\t\t\t\t\t\t\t.then(function(data) {{
-\t\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
-\t\t\t\t\t\t\t\t\t\tisSwitching = false;
-\t\t\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
-\t\t\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
-\t\t\t\t\t\t\t\t\t\t\tp.play().catch(function(e){{}});
-\t\t\t\t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t\t\t\talert('Stream error: ' + (data.message || 'Unknown error'));
-\t\t\t\t\t\t\t\t\t\t}}
-\t\t\t\t\t\t\t\t\t}})
-\t\t\t\t\t\t\t\t\t.catch(function(err) {{
-\t\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
-\t\t\t\t\t\t\t\t\t\tisSwitching = false;
-\t\t\t\t\t\t\t\t\t\talert('Error loading stream: ' + err);
-\t\t\t\t\t\t\t\t\t}});
+\t\t\t\t\t\t\t\t// Přepnutí na angličtinu s přesným časem bez PTS chyb
+\t\t\t\t\t\t\t\tloadHlsStream(savedTime);
 \t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
 \t\t\t\t\t\t}}
-\t\t\t\t\t}}
-\t\t\t\t}});
-
-\t\t\t\tp.on('seeked', function() {{
-\t\t\t\t\tif (currentAudioId !== "0" && !isSwitching) {{
-\t\t\t\t\t\tvar newTime = p.currentTime();
-\t\t\t\t\t\tfetch('/api/start_hls?path=' + basePath + '&track=' + currentAudioId + '&t=' + newTime)
-\t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
-\t\t\t\t\t\t\t.then(function(data) {{
-\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
-\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
-\t\t\t\t\t\t\t\t\tp.play().catch(function(e){{}});
-\t\t\t\t\t\t\t\t}}
-\t\t\t\t\t\t\t}});
 \t\t\t\t\t}}
 \t\t\t\t}});
 \t\t\t}}
@@ -535,22 +520,25 @@ class MediaHandler(BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
+            # ZÁSADNÍ PARAMETRY:
+            # -avoid_negative_ts make_zero srovná časovou osu obrazu i zvuku na nulu (žádný 50minutový rozestup)
+            # discont_start přikáže přehrávači okamžitý start
             cmd.extend([
                 "-i", full_path,
                 "-map", "0:v:0",
                 "-map", f"0:a:{track_idx}",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                "-avoid_negative_ts", "make_zero",
                 "-f", "hls",
-                "-hls_time", "2",
-                "-hls_list_size", "5",
-                "-hls_flags", "delete_segments+temp_file",
+                "-hls_time", "3",
+                "-hls_list_size", "8",
+                "-hls_flags", "delete_segments+temp_file+discont_start",
                 "-hls_segment_filename", "seg_%03d.ts",
                 "stream.m3u8"
             ])
 
             print(f"[+] Starting in-memory HLS stream (RAM) for track #{track_idx} at {start_t}s...")
-            # DŮLEŽITÉ: stdout a stderr jsou DEVNULL, aby nedocházelo k zamrznutí vyrovnávací paměti procesu
             active_hls_proc = subprocess.Popen(
                 cmd,
                 cwd=session_dir,
