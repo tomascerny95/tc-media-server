@@ -3,8 +3,8 @@
 TC-Media Server - Televize Library & Video.js Player.
 - Detekce titulků a zvukových stop (Čeština [aac], Angličtina [eac3]...).
 - Živý on-the-fly streaming s bleskovým převodem EAC3 -> AAC.
-- Web Audio API pro nezávislou hlasitost.
-- Automatická synchronizace zvuku s obrazem (nulové zpoždění, plynulý lip-sync).
+- Web Audio API pro oddělení hlasitosti.
+- Okamžitá synchronizace bez zamrzání přehrávače.
 """
 import os
 import sys
@@ -276,7 +276,7 @@ def build_player_page(video_path: str) -> str:
 {tracks_html}
 \t\t<p class="vjs-no-js">Chcete-li zobrazit toto video, povolte JavaScript.</p>
 \t</video>
-\t<audio id="altAudio" preload="none" style="display:none;"></audio>
+\t<audio id="altAudio" preload="auto" style="display:none;"></audio>
 \t<script>
 \t\tvar audioTracksData = {audio_tracks_json};
 \t\tvar currentAudioId = "0";
@@ -343,16 +343,9 @@ def build_player_page(video_path: str) -> str:
 \t\t\tfunction startAltAudioStream(seekTime) {{
 \t\t\t\tif (!isAltAudio) return;
 \t\t\t\tensureAudioGraph();
-\t\t\t\tupdateLevels();
 
 \t\t\t\tvar targetTime = Math.max(0, seekTime !== undefined ? seekTime : (p.currentTime() || 0));
 \t\t\t\taltAudioBaseTime = targetTime;
-
-\t\t\t\tvar wasPlaying = !p.paused();
-\t\t\t\t// Pozastavíme video, než se zvuk reálně spustí, aby video neuteklo napřed
-\t\t\t\tif (wasPlaying) {{
-\t\t\t\t\tp.pause();
-\t\t\t\t}}
 
 \t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + targetTime;
 \t\t\t\taltAudio.volume = p.volume();
@@ -361,15 +354,17 @@ def build_player_page(video_path: str) -> str:
 
 \t\t\t\tvar onAudioReady = function() {{
 \t\t\t\t\taltAudio.removeEventListener('playing', onAudioReady);
-\t\t\t\t\t// Jakmile zvuk začne reálně hrát, srovnáme video a pustíme ho současně
-\t\t\t\t\tp.currentTime(targetTime);
-\t\t\t\t\tif (wasPlaying) {{
-\t\t\t\t\t\tp.play().catch(function(e){{}});
+\t\t\t\t\tif (isAltAudio) {{
+\t\t\t\t\t\t// Jakmile zvuk reálně začne hrát, docvakneme video na stejný čas
+\t\t\t\t\t\tp.currentTime(targetTime);
+\t\t\t\t\t\tupdateLevels();
 \t\t\t\t\t}}
 \t\t\t\t}};
 
 \t\t\t\taltAudio.addEventListener('playing', onAudioReady, {{ once: true }});
-\t\t\t\taltAudio.play().catch(function(e){{}});
+\t\t\t\tif (!p.paused()) {{
+\t\t\t\t\taltAudio.play().catch(function(e){{}});
+\t\t\t\t}}
 \t\t\t}}
 
 \t\t\tp.on('volumechange', function() {{
@@ -380,7 +375,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\tensureAudioGraph();
 \t\t\t\tupdateLevels();
 \t\t\t\tif (isAltAudio) {{
-\t\t\t\t\tif (!altAudio.src || altAudio.src === '') {{
+\t\t\t\t\tif (!altAudio.src || altAudio.paused) {{
 \t\t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t\t}} else {{
 \t\t\t\t\t\taltAudio.play().catch(function(e){{}});
@@ -398,7 +393,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}}
 \t\t\t}});
 
-\t\t\t// Automatické jemné dorovnávání zvuku (Lip-Sync) za běhu
+\t\t\t// Jemné průběžné ladění synchronizace
 \t\t\tsetInterval(function() {{
 \t\t\t\tif (!isAltAudio || p.paused() || altAudio.paused || altAudio.readyState < 2) return;
 
@@ -406,19 +401,15 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\tvar currentVideoTime = p.currentTime();
 \t\t\t\tvar diff = currentVideoTime - currentAudioTime;
 
-\t\t\t\t// Rozdíl do 80ms je lidským okem nepostřehnutelný
-\t\t\t\tif (Math.abs(diff) < 0.08) {{
+\t\t\t\tif (Math.abs(diff) < 0.1) {{
 \t\t\t\t\taltAudio.playbackRate = p.playbackRate();
 \t\t\t\t}}
-\t\t\t\t// Pokud je video mírně napřed, zvuk neznatelně zrychlíme o 5 %, aby video dohnal
-\t\t\t\telse if (diff > 0.08 && diff < 0.5) {{
+\t\t\t\telse if (diff > 0.1 && diff < 0.5) {{
 \t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 1.05;
 \t\t\t\t}}
-\t\t\t\t// Pokud je zvuk napřed, mírně ho zpomalíme
-\t\t\t\telse if (diff < -0.08 && diff > -0.5) {{
+\t\t\t\telse if (diff < -0.1 && diff > -0.5) {{
 \t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 0.95;
 \t\t\t\t}}
-\t\t\t\t// Pokud došlo k většímu rozhození (např. lag sítě > 0.5s), srovnáme video přímo
 \t\t\t\telse if (Math.abs(diff) >= 0.5) {{
 \t\t\t\t\tp.currentTime(currentAudioTime);
 \t\t\t\t}}
@@ -598,12 +589,11 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
 
-            # Rychlý a přesný skok ve ffmpeg bez ukládání do vyrovnávací paměti
             cmd = ["ffmpeg", "-v", "error"]
             try:
                 t_val = float(start_t)
                 if t_val > 0:
-                    cmd.extend(["-accurate_seek", "-ss", str(t_val)])
+                    cmd.extend(["-ss", str(t_val)])
             except ValueError:
                 pass
 
@@ -612,7 +602,6 @@ class MediaHandler(BaseHTTPRequestHandler):
                 "-map", f"0:a:{track_idx}",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2",
                 "-flush_packets", "1",
-                "-muxdelay", "0",
                 "-f", "adts",
                 "pipe:1"
             ])
