@@ -6,6 +6,7 @@ TC-Media Server - Media Library & Video.js Player.
 - Ultra-fast HLS streaming for secondary audio tracks (EAC3->AAC):
   Instant playback (<1s), zero SD card wear (streams purely in RAM via /dev/shm),
   100% compatible with Smart TVs (Vewd, Opera TV, Tizen, WebOS) & Mobile (Android, iOS).
+- 30-second ceiling timeout for large high-bitrate files (e.g. 15-20GB MKV).
 """
 import os
 import sys
@@ -324,6 +325,13 @@ def build_player_page(video_path: str) -> str:
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
+\t\t\thtml5: {{
+\t\t\t\tvhs: {{
+\t\t\t\t\toverrideNative: false
+\t\t\t\t}},
+\t\t\t\tnativeAudioTracks: false,
+\t\t\t\tnativeVideoTracks: false
+\t\t\t}},
 \t\t\tcontrolBar: {{
 \t\t\t\taudioTrackButton: true
 \t\t\t}},
@@ -386,6 +394,8 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
 \t\t\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
 \t\t\t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
+\t\t\t\t\t\t\t\t\t\t}} else {{
+\t\t\t\t\t\t\t\t\t\t\talert('Stream error: ' + (data.message || 'Unknown error'));
 \t\t\t\t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\t\t\t}})
 \t\t\t\t\t\t\t\t\t.catch(function(err) {{
@@ -524,7 +534,7 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             m3u8_file = os.path.join(session_dir, "stream.m3u8")
 
-            cmd = ["ffmpeg", "-v", "error", "-y"]
+            cmd = ["ffmpeg", "-v", "warning", "-y"]
             try:
                 t_val = float(start_t)
                 if t_val > 0:
@@ -539,29 +549,42 @@ class MediaHandler(BaseHTTPRequestHandler):
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2",
                 "-f", "hls",
-                "-hls_time", "3",
+                "-hls_time", "2",
                 "-hls_list_size", "5",
                 "-hls_flags", "delete_segments",
-                "-hls_segment_filename", os.path.join(session_dir, "seg_%03d.ts"),
-                m3u8_file
+                "-hls_segment_filename", "seg_%03d.ts",
+                "stream.m3u8"
             ])
 
             print(f"[+] Starting in-memory HLS stream (RAM) for track #{track_idx} at {start_t}s...")
-            active_hls_proc = subprocess.Popen(cmd)
+            active_hls_proc = subprocess.Popen(
+                cmd,
+                cwd=session_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True
+            )
 
             is_ready = False
-            for _ in range(25):
-                if os.path.exists(m3u8_file) and os.path.getsize(m3u8_file) > 40:
+            error_msg = ""
+            # Až 30 sekund na vyhledání a zápis v RAM pro obří 15-20GB soubory
+            for _ in range(300):
+                if active_hls_proc.poll() is not None:
+                    error_msg = active_hls_proc.stderr.read()
+                    print(f"[!] FFmpeg error: {error_msg}")
+                    break
+
+                if os.path.exists(m3u8_file) and os.path.getsize(m3u8_file) > 20:
                     ts_files = [f for f in os.listdir(session_dir) if f.endswith(".ts")]
                     if len(ts_files) >= 1:
                         is_ready = True
                         break
-                time.sleep(0.08)
+                time.sleep(0.1)
 
             if is_ready:
                 resp = json.dumps({"status": "ready", "url": "/hls/session/stream.m3u8"}).encode("utf-8")
             else:
-                resp = json.dumps({"status": "error"}).encode("utf-8")
+                resp = json.dumps({"status": "error", "message": error_msg or "Timeout generating stream"}).encode("utf-8")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
