@@ -3,8 +3,8 @@
 TC-Media Server - Televize Library & Video.js Player.
 - Detekce všech titulků ve složce videa a vložení jako <track> stopy.
 - Detekce zvukových stop přes ffprobe (Čeština [aac], Angličtina [eac3]...).
-- Živý on-the-fly streaming audia: automatický převod nepodporovaných kodeků (EAC3, AC3, DTS) do AAC.
-- Plynulá synchronizace a okamžité seekování bez čekání.
+- Živý on-the-fly streaming audia s převodem EAC3/AC3 do AAC.
+- Web Audio API pro oddělení hlasitosti: žádné zacyklené MUTE.
 """
 import os
 import sys
@@ -49,7 +49,7 @@ mimetypes.add_type("text/vtt", ".vtt")
 
 FAVICON_BASE64 = (
     "data:image/x-icon;base64,AAABAAYAAAAAAAEAIADqMAAAZgAAAICAAAABACAAKAgBAFAxAABAQAAAAQAgAChCAAB4OQEAMDAAAAEAIACoJQAAoHsBACAgAA"
-    "ABACAAqBAAAEihAQAQEAAAAQAgAGgEAADwsQEAiVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAwsUlEQVR42u2dWXMkyZHf/xGRWVkXzgLQF/qY"
+    "ABACAAqBAAAEihAQAQEAAAAQAgAGgEAADwsQEAiVBORw0KGgoAAASUhEUgAAAQAAAAEACAYAAABccqhmAAAwsUlEQVR42u2dWXMkyZHf/xGRWVkXzgLQF/qY"
     "me65umeGxyx3luRybR+l1cpMJpPpUabPJTN9BJkepBcdtmvUrkhxODyG5FzsOfpAN7objRt1ZWa4HgpAhkfWTAFVBaCA9B+NNGYhIysrD+9wD/e/K+xDRARBE"
     "AqBUkoBgD7rExEE4ewQAyAIBUYMgCAUGDEAglBgxAAIQoERAyAIBUYMgCAUmOCsT6BwuCUXRKAk4X/vdgGy2XaSglJnH0tAHPMxYcg2Vb0OVSplH2jd++9xiG"
     "N+bkkCarXcHwKkaf48VPY9yhggcB4xrfh5AYAJgF5aunAGiAE4TawFuS8vEezz53yXx4/Yi0Yb67Dr69l2pwP79Ckbo69cYS9R+NO/hrl+/XBblctQtfrxTvXF"
@@ -271,7 +271,7 @@ def build_player_page(video_path: str) -> str:
 \t<link rel="shortcut icon" href="{FAVICON_BASE64}" />
 </head>
 {buffer_inject}<body>
-\t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto">
+\t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto" crossorigin="anonymous">
 \t\t<source src="{stream_url}" type="video/mp4">
 {tracks_html}
 \t\t<p class="vjs-no-js">Chcete-li zobrazit toto video, povolte JavaScript.</p>
@@ -283,6 +283,9 @@ def build_player_page(video_path: str) -> str:
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
 \t\tvar altAudio = document.getElementById('altAudio');
 \t\tvar isAltAudio = false;
+
+\t\tvar audioCtx = null;
+\t\tvar videoGain = null;
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
@@ -311,17 +314,37 @@ def build_player_page(video_path: str) -> str:
 \t\t\tvar p = this;
 \t\t\tvar rawVideo = p.el().querySelector('video');
 
-\t\t\tfunction enforceState() {{
+\t\t\t// Inicializace WebAudio uzlu pro umlčení videa bez zásahu do MUTE stavu
+\t\t\tfunction ensureAudioGraph() {{
+\t\t\t\tif (!audioCtx) {{
+\t\t\t\t\ttry {{
+\t\t\t\t\t\taudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+\t\t\t\t\t\tvar src = audioCtx.createMediaElementSource(rawVideo);
+\t\t\t\t\t\tvideoGain = audioCtx.createGain();
+\t\t\t\t\t\tsrc.connect(videoGain);
+\t\t\t\t\t\tvideoGain.connect(audioCtx.destination);
+\t\t\t\t\t}} catch (e) {{}}
+\t\t\t\t}}
+\t\t\t\tif (audioCtx && audioCtx.state === 'suspended') {{
+\t\t\t\t\taudioCtx.resume();
+\t\t\t\t}}
+\t\t\t}}
+
+\t\t\tfunction updateLevels() {{
 \t\t\t\tif (isAltAudio) {{
-\t\t\t\t\trawVideo.muted = true;
+\t\t\t\t\tif (videoGain) videoGain.gain.value = 0;
 \t\t\t\t\taltAudio.volume = p.volume();
 \t\t\t\t\taltAudio.muted = p.muted();
+\t\t\t\t}} else {{
+\t\t\t\t\tif (videoGain) videoGain.gain.value = 1;
 \t\t\t\t}}
 \t\t\t}}
 
 \t\t\tfunction startAltAudioStream(seekTime) {{
 \t\t\t\tif (!isAltAudio) return;
-\t\t\t\tvar t = Math.max(0, seekTime || p.currentTime() || 0);
+\t\t\t\tensureAudioGraph();
+\t\t\t\tupdateLevels();
+\t\t\t\tvar t = Math.max(0, seekTime !== undefined ? seekTime : (p.currentTime() || 0));
 \t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + t;
 \t\t\t\taltAudio.volume = p.volume();
 \t\t\t\taltAudio.muted = p.muted();
@@ -332,11 +355,12 @@ def build_player_page(video_path: str) -> str:
 \t\t\t}}
 
 \t\t\tp.on('volumechange', function() {{
-\t\t\t\tenforceState();
+\t\t\t\tupdateLevels();
 \t\t\t}});
 
 \t\t\tp.on('play', function() {{
-\t\t\t\tenforceState();
+\t\t\t\tensureAudioGraph();
+\t\t\t\tupdateLevels();
 \t\t\t\tif (isAltAudio) {{
 \t\t\t\t\tif (!altAudio.src || altAudio.src === '') {{
 \t\t\t\t\t\tstartAltAudioStream(p.currentTime());
@@ -351,16 +375,10 @@ def build_player_page(video_path: str) -> str:
 \t\t\t}});
 
 \t\t\tp.on('seeked', function() {{
-\t\t\t\tenforceState();
 \t\t\t\tif (isAltAudio) {{
 \t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t}}
 \t\t\t}});
-
-\t\t\t// Kontrola zpoždění
-\t\t\tsetInterval(function() {{
-\t\t\t\tenforceState();
-\t\t\t}}, 1500);
 
 \t\t\t// Naplnění výběru zvukových stop do Video.js
 \t\t\tif (audioTracksData.length > 1) {{
@@ -375,22 +393,20 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}});
 
 \t\t\t\tp.audioTracks().addEventListener('change', function() {{
+\t\t\t\t\tensureAudioGraph();
 \t\t\t\t\tfor (var i = 0; i < p.audioTracks().length; i++) {{
 \t\t\t\t\t\tvar tr = p.audioTracks()[i];
 \t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
 \t\t\t\t\t\t\tcurrentAudioId = tr.id;
 \t\t\t\t\t\t\tif (tr.id === "0") {{
-\t\t\t\t\t\t\t\t// Zpět na výchozí stopu (Čeština [aac])
+\t\t\t\t\t\t\t\t// Návrat na Češtinu [aac]
 \t\t\t\t\t\t\t\tisAltAudio = false;
 \t\t\t\t\t\t\t\taltAudio.pause();
 \t\t\t\t\t\t\t\taltAudio.removeAttribute('src');
-\t\t\t\t\t\t\t\taltAudio.load();
-\t\t\t\t\t\t\t\trawVideo.muted = p.muted();
-\t\t\t\t\t\t\t\trawVideo.volume = p.volume();
+\t\t\t\t\t\t\t\tupdateLevels();
 \t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t// Přepnutí na alternativní stopu (Angličtina [eac3] -> živý AAC stream)
+\t\t\t\t\t\t\t\t// Angličtina [eac3 -> živý AAC stream]
 \t\t\t\t\t\t\t\tisAltAudio = true;
-\t\t\t\t\t\t\t\trawVideo.muted = true;
 \t\t\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
@@ -538,7 +554,6 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
 
-            # Rychlý start od zadaného času
             cmd = ["ffmpeg", "-v", "error"]
             try:
                 t_val = float(start_t)
@@ -547,7 +562,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
-            # Vezmeme stopu (např. EAC3) a za běhu ji pošleme jako AAC Stereo ADTS stream
             cmd.extend([
                 "-i", full_path,
                 "-map", f"0:a:{track_idx}",
@@ -561,6 +575,7 @@ class MediaHandler(BaseHTTPRequestHandler):
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/aac")
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
 
@@ -600,6 +615,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", mime_type)
             self.send_header("Content-Length", str(file_size))
             self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             try:
                 with open(file_path, "rb") as f:
@@ -634,6 +650,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Content-Length", str(content_length))
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         try:
