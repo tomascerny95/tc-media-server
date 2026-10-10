@@ -1,139 +1,113 @@
 # TC-Media Server
 
-A lightweight, headless media server optimized for **Raspberry Pi** and Linux, running directly from the local Git repository.
-
-- **qBittorrent-nox** on port `8080` (headless torrent management)
-- **Web Video Player** on port `5000` (pure Python video library with cinema-mode player in a new tab)
-- Shared media directory at `/dlna` with automated permissions
+A lightweight, headless media server and cinema-mode web video player optimized for Raspberry Pi and Linux, designed to run directly from a local Git repository.
 
 ---
 
-## ⚡ Features
-- **Extremely Low Footprint**: Zero heavy database or indexing overhead (no DLNA/Plex/Jellyfin daemon bloat).
-- **Dedicated Player View**: Browse the library on the main page, select subtitles, and open video in a clean fullscreen cinema player in a new tab.
-- **HTTP 206 Partial Content**: Smooth scrubbing and seeking support directly in the browser HTML5 player.
-- **On-the-Fly Subtitle Parsing**: Automatically discovers `.srt` and `.vtt` subtitles, converting SRT to WebVTT dynamically.
-- **In-Place Git Execution**: Runs straight from the cloned Git directory—seamless updates via `git pull`.
+## Overview
+
+TC-Media Server combines a clean, modern web library and video player with headless torrent management. It serves as an ultra-low-footprint alternative to heavy media servers like Plex or Jellyfin by completely avoiding background databases, telemetry, and heavy transcoding daemons.
+
+### Key Components
+
+- **Web Video Player (Port 5000):** Pure Python HTTP service providing a searchable video catalog and a responsive cinema-mode HTML5 player (powered by Video.js).
+- **Headless qBittorrent-nox (Port 8080):** Web-managed BitTorrent client downloading directly to the shared media path.
+- **Shared Storage (/dlna):** Unified directory for media files with automated permission management.
 
 ---
 
-## 🚀 Installation on Raspberry Pi
+## Features
 
+- **Multi-Track Audio Switching:** Detects embedded audio streams (e.g., English, Czech) via ffprobe and allows seamless switching directly from the player interface.
+- **On-the-Fly Audio Transcoding:** Automatically streams unsupported audio codecs (such as Dolby Digital Plus EAC3, AC3, and DTS) into universal AAC stereo in real-time with negligible CPU usage.
+- **Dynamic Lip-Sync Calibration:** Intelligent timestamp alignment and playback rate adjustments prevent audio delay or video freezing during stream transitions.
+- **HTTP 206 Partial Content:** Full byte-range seeking (scrubbing) support for smooth timeline navigation.
+- **Subtitles on the Fly:** Automatic discovery of local .srt and .vtt subtitles with dynamic conversion of SRT subtitles into compliant WebVTT streams.
+- **Web Audio API Isolation:** Independent audio gain nodes prevent playback loops or accidental mute states when switching tracks.
+- **Minimal Footprint:** Idles near 0% CPU and requires minimal RAM, making it ideal for Raspberry Pi 3/4/5 and low-power hardware.
+- **Systemd Integration:** Fully managed by systemd background services (tc-media-player.service and qbittorrent.service) with auto-start on boot.
+
+---
+
+## Architecture & Ports
+
+| Service | Port | Description |
+| :--- | :--- | :--- |
+| **TC-Media Player** | `5000` | Web catalog library and video player |
+| **qBittorrent WebUI** | `8080` | Torrent management interface |
+| **Media Path** | `/dlna` | Default storage directory for media files |
+
+---
+
+## Prerequisites
+
+- Debian / Ubuntu / Raspberry Pi OS
+- Python 3.8+
+- FFmpeg & ffprobe
+- qBittorrent-nox
+
+*(All packages and dependencies are automatically configured by the setup script).*
+
+---
+
+## Quick Installation
+
+1. **Clone the repository:**
 ```bash
-# 1. Clone repository to your home directory
-cd ~
 git clone https://github.com/tomascerny95/tc-media-server.git
-
-# 2. Enter folder, make script executable, and run installer
 cd tc-media-server
+```
+
+2. **Run the automated setup script:**
+```bash
 chmod +x setup_tc_media.sh
-sudo bash ./setup_tc_media.sh
+sudo ./setup_tc_media.sh
+```
+
+3. **Access the web interfaces:**
+   - **Video Library & Player:** http://<YOUR_IP>:5000
+   - **qBittorrent Management:** http://<YOUR_IP>:8080 *(default username: admin, check terminal for temporary password on first run)*
+
+---
+
+## Manual Execution
+
+You can also run the server directly without systemd:
+
+```bash
+# Start server with default directory (/dlna)
+python3 server.py
+
+# Or specify a custom media directory
+python3 server.py /path/to/my/videos
 ```
 
 ---
 
-## 🌐 Web Interfaces
+## Project Structure
 
-| Service | Address | Description |
-|---|---|---|
-| **Web Video Player** | `http://<RPI_IP>:5000` | Browse media catalog & play videos |
-| **qBittorrent WebUI** | `http://<RPI_IP>:8080` | Manage torrent downloads |
-
----
-
-## ⚙️ Essential Post-Installation Settings (qBittorrent)
-
-Open the qBittorrent WebUI at `http://<RPI_IP>:8080` and configure the following:
-
-### 1. Storage Location
-Navigate to **Tools ➔ Options ➔ Downloads**:
-- Set **Default Save Path** to `/dlna`.
-
-### 2. Tailscale & Domain Access (.local / .ts.net)
-To access qBittorrent seamlessly without password prompts or domain blocking when using **mDNS (`.local`)** or **Tailscale (`.ts.net`)**, go to **Tools ➔ Options ➔ Web UI**:
-
-- ✅ Check: **Bypass authentication for clients on localhost**
-- ✅ Check: **Bypass authentication for clients in whitelisted subnets**
-- In the IP subnet box, enter:
 ```text
-0.0.0.0/0
-::/0
-```
-- Under **Security**, uncheck the following options:
-  - ❌ Uncheck: **Enable Host header validation** *(prevents domain-blocking on .local and Tailscale)*
-  - ❌ Uncheck: **Enable Cross-Site Request Forgery (CSRF) protection**
-  - ❌ Uncheck: **Enable clickjacking protection**
-
-Click **Save** at the bottom.
-
----
-
-## 🔄 Updating to the Latest Version
-
-### Quick Update (Recommended)
-Run this single compound command to reset any local changes, pull the latest code, and restart services:
-
-```bash
-cd ~/tc-media-server
-git fetch origin && git reset --hard origin/main && chmod +x setup_tc_media.sh && sudo bash ./setup_tc_media.sh
+tc-media-server/
+├── buffer.html          # Cinema-mode player assets (Video.js, plugins, styles)
+├── server.py            # Core Python HTTP server (API, streaming, audio conversion)
+├── setup_tc_media.sh    # Automated installation and systemd deployment script
+├── README.md            # Project documentation
+└── LICENSE              # Open source license
 ```
 
 ---
 
-## 🛠️ Troubleshooting Common Issues
+## Endpoints
 
-### 1. qBittorrent asks for password on `tc-media.local` or Tailscale
-- **Cause:** Domain access and Tailscale resolve to **IPv6** addresses. If only IPv4 was whitelisted, or if Host header validation is active, qBittorrent blocks access or prompts for credentials.
-- **Fix:** In **Tools ➔ Options ➔ Web UI**, ensure `::/0` is added to the subnet whitelist and **Enable Host header validation** is unchecked.
-
----
-
-### 2. `error: Your local changes would be overwritten by merge (Aborting)`
-- **Cause:** Local file modifications or permission adjustments conflict with remote commits.
-- **Fix:** Discard local changes and force-sync with the remote repository:
-```bash
-git fetch origin
-git reset --hard origin/main
-```
+- `GET /` - Main searchable media library interface.
+- `GET /player?video=<path>` - Cinema-mode video player view.
+- `GET /stream?path=<path>` - HTTP 206 partial content direct video stream.
+- `GET /audio_stream?path=<path>&track=<index>&t=<seconds>` - Real-time AAC audio stream for secondary tracks.
+- `GET /subtitle?path=<path>` - WebVTT subtitle stream (SRT converted on the fly).
+- `GET /api/videos?page=<num>&q=<query>` - JSON API for library search and pagination.
 
 ---
 
-### 3. `sudo: ./setup_tc_media.sh: command not found`
-- **Cause:** The script lost its execution bit (`+x`) during Git reset, or contains Windows CRLF line endings (`\r`).
-- **Fix:** Remove carriage returns, re-apply execute permissions, and run via Bash:
-```bash
-sed -i 's/\r$//' setup_tc_media.sh
-chmod +x setup_tc_media.sh
-sudo bash ./setup_tc_media.sh
-```
+## License
 
----
-
-### 4. `./setup_tc_media.sh: Bad substitution` or `[: Illegal number:`
-- **Cause:** The script was executed with `sh` (`sh ./setup_tc_media.sh`). In Debian/Raspberry Pi OS, `/bin/sh` points to `dash`, which lacks Bash syntax support.
-- **Fix:** Always execute using `bash`:
-```bash
-sudo bash ./setup_tc_media.sh
-```
-
----
-
-## 🔧 Service Management (systemd)
-
-```bash
-# Check service status
-sudo systemctl status tc-media-player
-sudo systemctl status qbittorrent
-
-# Restart services
-sudo systemctl restart tc-media-player
-sudo systemctl restart qbittorrent
-
-# View live player logs
-journalctl -u tc-media-player -f
-```
-
----
-
-## 📄 License
-MIT License
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
