@@ -3,10 +3,9 @@
 TC-Media Server - Media Library & Video.js Player.
 - Automated detection of subtitles and audio tracks.
 - Direct Play (HTTP 206) for default audio tracks.
-- Ultra-fast HLS streaming for secondary audio tracks (EAC3->AAC):
-  Instant playback (<1s), zero SD card wear (streams purely in RAM via /dev/shm),
-  100% compatible with Smart TVs (Vewd, Opera TV, Tizen, WebOS) & Mobile (Android, iOS).
-- 30-second ceiling timeout for large high-bitrate files (e.g. 15-20GB MKV).
+- Ultra-fast in-memory HLS streaming for secondary audio tracks (EAC3->AAC):
+  Atomic segment creation (temp_file flag prevents corrupt partial reads),
+  zero SD card wear (RAM disk via /dev/shm), 100% compatible with Smart TVs & Mobile.
 """
 import os
 import sys
@@ -377,6 +376,7 @@ def build_player_page(video_path: str) -> str:
 
 \t\t\t\t\t\t\tif (tr.id === "0") {{
 \t\t\t\t\t\t\t\t// Return to default track (Czech) - Direct Play
+\t\t\t\t\t\t\t\tp.reset();
 \t\t\t\t\t\t\t\tp.src({{ src: '/stream?path=' + basePath, type: 'video/mp4' }});
 \t\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
 \t\t\t\t\t\t\t\t\tp.currentTime(savedTime);
@@ -392,8 +392,9 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t\t\t\tspinner.style.display = 'none';
 \t\t\t\t\t\t\t\t\t\tisSwitching = false;
 \t\t\t\t\t\t\t\t\t\tif (data.status === 'ready') {{
+\t\t\t\t\t\t\t\t\t\t\tp.reset();
 \t\t\t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
-\t\t\t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
+\t\t\t\t\t\t\t\t\t\t\tp.play();
 \t\t\t\t\t\t\t\t\t\t}} else {{
 \t\t\t\t\t\t\t\t\t\t\talert('Stream error: ' + (data.message || 'Unknown error'));
 \t\t\t\t\t\t\t\t\t\t}}
@@ -416,6 +417,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\t\t.then(function(res) {{ return res.json(); }})
 \t\t\t\t\t\t\t.then(function(data) {{
 \t\t\t\t\t\t\t\tif (data.status === 'ready') {{
+\t\t\t\t\t\t\t\t\tp.reset();
 \t\t\t\t\t\t\t\t\tp.src({{ src: data.url, type: 'application/x-mpegURL' }});
 \t\t\t\t\t\t\t\t\tp.play();
 \t\t\t\t\t\t\t\t}}
@@ -542,6 +544,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
+            # Klíčový parametr: temp_file zajistí, že se segment zveřejní až jako 100% hotový
             cmd.extend([
                 "-i", full_path,
                 "-map", "0:v:0",
@@ -551,7 +554,7 @@ class MediaHandler(BaseHTTPRequestHandler):
                 "-f", "hls",
                 "-hls_time", "2",
                 "-hls_list_size", "5",
-                "-hls_flags", "delete_segments",
+                "-hls_flags", "delete_segments+temp_file",
                 "-hls_segment_filename", "seg_%03d.ts",
                 "stream.m3u8"
             ])
@@ -567,18 +570,21 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             is_ready = False
             error_msg = ""
-            # Až 30 sekund na vyhledání a zápis v RAM pro obří 15-20GB soubory
-            for _ in range(300):
+            for _ in range(300):  # Až 30 sekund strop pro otevření velkých souborů
                 if active_hls_proc.poll() is not None:
                     error_msg = active_hls_proc.stderr.read()
                     print(f"[!] FFmpeg error: {error_msg}")
                     break
 
+                # Kontrolujeme, že je hotový playlist a existuje reálný dílek (nikoli nehotový .tmp!)
                 if os.path.exists(m3u8_file) and os.path.getsize(m3u8_file) > 20:
-                    ts_files = [f for f in os.listdir(session_dir) if f.endswith(".ts")]
+                    ts_files = [f for f in os.listdir(session_dir) if f.endswith(".ts") and not f.endswith(".tmp")]
                     if len(ts_files) >= 1:
-                        is_ready = True
-                        break
+                        first_ts = os.path.join(session_dir, ts_files[0])
+                        # Ověříme, že dílek už má reálnou velikost (nejen 45 kB!)
+                        if os.path.getsize(first_ts) > 100 * 1024:
+                            is_ready = True
+                            break
                 time.sleep(0.1)
 
             if is_ready:
@@ -600,6 +606,11 @@ class MediaHandler(BaseHTTPRequestHandler):
 
             if not target_file.startswith(os.path.abspath(HLS_BASE_DIR)) or not os.path.exists(target_file):
                 self.send_error(404, "Segment not found")
+                return
+
+            # Zamezíme odesílání nehotových dočasných dílků
+            if target_file.endswith(".tmp"):
+                self.send_error(404, "Segment still writing")
                 return
 
             if target_file.endswith(".m3u8"):
