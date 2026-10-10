@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-TC-Media Server - Televize Library & Video.js Player.
-- Přímé vložení obsahu souboru buffer.html do <head>.
-- Žádné externí stahování, žádný poster obrázek.
-- Range streaming (HTTP 206) a konverze titulků SRT -> WebVTT.
+TC-Media Server - Custom Televize Library & Video.js Player.
+- Knihovna s kartami videí a okamžitým výběrem titulků.
+- Přehrávač s Video.js strukturou bez poster obrázku.
+- Obsah souboru buffer.html se vkládá přesně mezi </head> a <body>.
+- Range streaming (HTTP 206) a automatická konverze SRT -> WebVTT.
 """
 import os
 import sys
@@ -57,7 +58,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1e242c; color: #f0f0f0; margin: 0; padding: 20px 0; }
         .container { width: 92%; max-width: 1200px; margin: 0 auto; background: #2a313c; padding: 25px 30px; border-radius: 8px; border: 1px solid #3a414c; }
-        h1 { text-align: center; color: #fff; margin-bottom: 30px; }
+        h1 { text-align: center; color: #fff; margin-bottom: 30px; font-size: 2.8rem; font-weight: 700; }
         .url-form { display: flex; justify-content: center; margin-bottom: 40px; gap: 10px; }
         .url-form input { width: 100%; max-width: 450px; padding: 12px 18px; border: 1px solid #3a414c; border-radius: 6px; background: #1e242c; color: #fff; font-size: 1rem; }
         .url-form button { padding: 12px 22px; background: #e54c4c; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
@@ -78,7 +79,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
     <div class="container">
         <h1>Televize</h1>
         <form class="url-form">
-            <input type="text" name="q" placeholder="Hledat video...">
+            <input type="text" name="q" placeholder="Hledat video v knihovně...">
             <button type="submit">Hledat</button>
         </form>
         <div class="video-list"></div>
@@ -160,7 +161,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
 """
 
 def get_buffer_content() -> str:
-    """Načte surový obsah ze souboru buffer.html."""
+    """Načte přesný obsah souboru buffer.html, pokud existuje."""
     if os.path.exists(BUFFER_FILE):
         try:
             with open(BUFFER_FILE, "r", encoding="utf-8") as f:
@@ -176,15 +177,16 @@ def build_player_page(video_path: str, sub_path: str) -> str:
     sub_tag = ""
     if sub_path:
         sub_url = f"/subtitle?path={urllib.parse.quote(sub_path)}"
-        sub_tag = f'\t\t<track src="{sub_url}" kind="captions" label="Titulky: cze - 1" default />'
+        sub_tag = f'\t\t<track src="{sub_url}" kind="captions" label="Titulky: cze - 1" />'
 
     buffer_inject = get_buffer_content()
 
     html = f"""<head>
 \t<title>{file_name}</title>
 \t<link rel="shortcut icon" href="{FAVICON_BASE64}" />
-{buffer_inject}
 </head>
+
+{buffer_inject}
 
 <body>
 \t<video id="videoPlayer" class="video-js vjs-big-play-centered">
