@@ -1,56 +1,44 @@
 #!/usr/bin/env python3
 """
-<<<<<<< HEAD
 TC-Media Server - Media Library & Video.js Player.
-- Automated detection of subtitles and audio tracks.
-- Direct Play (HTTP 206) for default audio tracks.
-- Ultra-fast in-memory HLS streaming for secondary audio tracks (EAC3->AAC):
-  Normalized PTS timestamps (avoids PTS gaps when switching mid-movie),
-  zero SD card wear (RAM disk via /dev/shm), 100% compatible with Smart TVs & Mobile.
-=======
-TC-Media Server - Televize Library & Video.js Player.
-- Detekce titulků a zvukových stop (Čeština [aac], Angličtina [eac3]...).
-- Živý on-the-fly streaming s bleskovým převodem EAC3 -> AAC.
-- Web Audio API pro oddělení hlasitosti.
-- Ochrana proti cyklení restartu streamu (vyřešen 5s freeze loop).
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
+- Automated detection of subtitles and injection as <track> elements.
+- Audio track discovery via ffprobe (English [eac3], Czech [aac], etc.).
+- Real-time on-the-fly audio streaming with EAC3/AC3 to AAC conversion.
+- Web Audio API integration for independent volume control.
+- Seamless video/audio synchronization with loop-prevention guards.
 """
 import os
 import sys
 import re
 import json
-import time
 import shutil
-import tempfile
 import subprocess
 import mimetypes
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-# --- KONFIGURACE ---
+# --- CONFIGURATION ---
 HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
 BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.html")
-
-# RAM disk (/dev/shm) - eliminates SD card writes completely
-HLS_BASE_DIR = "/dev/shm/tc_hls" if os.path.exists("/dev/shm") else os.path.join(tempfile.gettempdir(), "tc_hls")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
 CHUNK_SIZE = 64 * 1024
 
 LANG_MAP = {
-    "cze": "Čeština", "ces": "Čeština", "cs": "Čeština",
-    "eng": "Angličtina", "en": "Angličtina",
-    "slo": "Slovenština", "slk": "Slovenština", "sk": "Slovenština",
-    "ger": "Němčina", "deu": "Němčina", "de": "Němčina",
-    "fre": "Francouzština", "fra": "Francouzština", "fr": "Francouzština",
-    "spa": "Španělština", "es": "Španělština",
-    "ita": "Italština", "it": "Italština",
-    "rus": "Ruština", "ru": "Ruština",
-    "jpn": "Japonština", "ja": "Japonština",
-    "und": "Nespecifikováno"
+    "cze": "Czech", "ces": "Czech", "cs": "Czech",
+    "eng": "English", "en": "English",
+    "slo": "Slovak", "slk": "Slovak", "sk": "Slovak",
+    "ger": "German", "deu": "German", "de": "German",
+    "fre": "French", "fra": "French", "fr": "French",
+    "spa": "Spanish", "es": "Spanish",
+    "ita": "Italian", "it": "Italian",
+    "rus": "Russian", "ru": "Russian",
+    "jpn": "Japanese", "ja": "Japanese",
+    "pol": "Polish", "pl": "Polish",
+    "und": "Undefined"
 }
 
 mimetypes.init()
@@ -58,8 +46,7 @@ mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/webm", ".webm")
 mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
-mimetypes.add_type("application/x-mpegURL", ".m3u8")
-mimetypes.add_type("video/MP2T", ".ts")
+mimetypes.add_type("audio/aac", ".aac")
 mimetypes.add_type("text/vtt", ".vtt")
 
 FAVICON_BASE64 = (
@@ -78,24 +65,12 @@ THUMBNAIL_SVG = urllib.parse.quote("""<svg xmlns="http://www.w3.org/2000/svg" vi
 </svg>""")
 DEFAULT_THUMBNAIL = f"data:image/svg+xml;utf8,{THUMBNAIL_SVG}"
 
-active_hls_proc = None
-
-def cleanup_active_hls():
-    global active_hls_proc
-    if active_hls_proc:
-        try:
-            active_hls_proc.kill()
-            active_hls_proc.wait()
-        except Exception:
-            pass
-        active_hls_proc = None
-
 LIBRARY_HTML = """<!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Televize</title>
+    <title>TC-Media Server</title>
     <link rel="shortcut icon" href="__FAVICON__">
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1e242c; color: #f0f0f0; margin: 0; padding: 20px 0; }
@@ -119,13 +94,13 @@ LIBRARY_HTML = """<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>Televize</h1>
+        <h1>TC-Media Server</h1>
         <form class="url-form">
-            <input type="text" name="q" placeholder="Hledat video v knihovně...">
-            <button type="submit">Hledat</button>
+            <input type="text" name="q" placeholder="Search library...">
+            <button type="submit">Search</button>
         </form>
         <div class="video-list"></div>
-        <div class="loading">Načítám...</div>
+        <div class="loading">Loading...</div>
     </div>
     <script>
         var page = 1, query = '', loading = false, finished = false;
@@ -151,7 +126,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
                                 '<div class="video-thumbnail"><img src="' + v.thumbnail + '"></div>' +
                                 '<div class="video-details">' +
                                     '<p title="' + v.title + '">' + v.title + '</p>' +
-                                    '<div class="play-link">Přehrát ↗</div>' +
+                                    '<div class="play-link">Play ↗</div>' +
                                 '</div>';
                             list.appendChild(item);
                         });
@@ -159,7 +134,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
                     }
                     if (data.length < 20) {
                         finished = true;
-                        loader.textContent = data.length === 0 && page === 1 ? 'Nenalezena žádná videa.' : 'Vše načteno.';
+                        loader.textContent = data.length === 0 && page === 1 ? 'No videos found.' : 'All videos loaded.';
                     } else {
                         loader.style.display = 'none';
                     }
@@ -194,7 +169,7 @@ def get_buffer_content() -> str:
             with open(BUFFER_FILE, "r", encoding="utf-8") as f:
                 return f.read()
         except Exception as e:
-            print(f"[!] Chyba při čtení buffer.html: {e}")
+            print(f"[!] Error reading buffer.html: {e}")
     return ""
 
 def find_subtitles_in_dir(video_rel_path: str):
@@ -272,11 +247,11 @@ def get_audio_tracks(video_rel_path: str):
 
         return tracks
     except Exception as e:
-        print(f"[!] Chyba při detekci audia: {e}")
+        print(f"[!] Error detecting audio tracks: {e}")
         return []
 
 def build_player_page(video_path: str) -> str:
-    file_name = os.path.basename(video_path) if video_path else "Přehrávač"
+    file_name = os.path.basename(video_path) if video_path else "Player"
     stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
 
     track_tags = []
@@ -285,7 +260,7 @@ def build_player_page(video_path: str) -> str:
         for s in subs:
             sub_url = f"/subtitle?path={urllib.parse.quote(s['path'])}"
             def_attr = " default" if s["default"] else ""
-            label = f"Titulky: {s['name']}"
+            label = f"Subtitles: {s['name']}"
             track_tags.append(f'\t\t<track src="{sub_url}" kind="captions" label="{label}"{def_attr} />')
 
     tracks_html = "\n".join(track_tags)
@@ -294,43 +269,27 @@ def build_player_page(video_path: str) -> str:
     buffer_inject = get_buffer_content()
 
     html = f"""<head>
-\t<title>{file_name}</title>
+\t<title>{file_name} - TC-Media Server</title>
 \t<link rel="shortcut icon" href="{FAVICON_BASE64}" />
-\t<style>
-\t\t#tv-spinner {{
-\t\t\tdisplay: none;
-\t\t\tposition: absolute;
-\t\t\ttop: 50%;
-\t\t\tleft: 50%;
-\t\t\ttransform: translate(-50%, -50%);
-\t\t\tz-index: 1000;
-\t\t\tbackground: rgba(0, 0, 0, 0.85);
-\t\t\tcolor: white;
-\t\t\tpadding: 15px 25px;
-\t\t\tborder-radius: 8px;
-\t\t\tfont-size: 1.1rem;
-\t\t\tfont-family: sans-serif;
-\t\t\ttext-align: center;
-\t\t\tborder: 1px solid #555;
-\t\t}}
-\t</style>
 </head>
 {buffer_inject}<body>
-\t<div id="tv-spinner">Starting stream...</div>
-\t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto">
-\t\t<source src="{stream_url}">
+\t<video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto" crossorigin="anonymous">
+\t\t<source src="{stream_url}" type="video/mp4">
 {tracks_html}
-<<<<<<< HEAD
-\t\t<p class="vjs-no-js">To view this video please enable JavaScript.</p>
-=======
-\t\t<p class="vjs-no-js">Chcete-li zobrazit toto video, povolte JavaScript.</p>
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
+\t\t<p class="vjs-no-js">To view this video please enable JavaScript, and consider upgrading to a web browser that <a href="https://videojs.com/html5-video-support/" target="_blank">supports HTML5 video</a>.</p>
 \t</video>
+\t<audio id="altAudio" preload="auto" style="display:none;"></audio>
 \t<script>
 \t\tvar audioTracksData = {audio_tracks_json};
 \t\tvar currentAudioId = "0";
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
-\t\tvar spinner = document.getElementById('tv-spinner');
+\t\tvar altAudio = document.getElementById('altAudio');
+\t\tvar isAltAudio = false;
+
+\t\tvar altAudioBaseTime = 0;
+\t\tvar isProgrammaticSeek = false;
+\t\tvar audioCtx = null;
+\t\tvar videoGain = null;
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
@@ -357,20 +316,8 @@ def build_player_page(video_path: str) -> str:
 \t\t\t}}
 \t\t}}, function() {{
 \t\t\tvar p = this;
+\t\t\tvar rawVideo = p.el().querySelector('video');
 
-<<<<<<< HEAD
-\t\t\tfunction loadHlsStream(startTime) {{
-\t\t\t\tspinner.style.display = 'block';
-\t\t\t\tfetch('/api/start_hls?path=' + basePath + '&track=' + currentAudioId + '&t=' + Math.floor(startTime))
-\t\t\t\t\t.then(function(res) {{ return res.json(); }})
-\t\t\t\t\t.then(function(data) {{
-\t\t\t\t\t\tspinner.style.display = 'none';
-\t\t\t\t\t\tif (data.status === 'ready') {{
-\t\t\t\t\t\t\tp.src({{ src: data.url + '?v=' + Date.now(), type: 'application/x-mpegURL' }});
-\t\t\t\t\t\t\tp.play().catch(function(e){{}});
-\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\talert('Stream error: ' + (data.message || 'Unknown error'));
-=======
 \t\t\tfunction ensureAudioGraph() {{
 \t\t\t\tif (!audioCtx) {{
 \t\t\t\t\ttry {{
@@ -414,21 +361,20 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\taltAudio.removeEventListener('playing', onAudioReady);
 \t\t\t\t\tif (isAltAudio) {{
 \t\t\t\t\t\tvar diff = p.currentTime() - targetTime;
-\t\t\t\t\t\t// Pokud video během startu zvuku mírně uteklo, srovnáme ho bez vyvolání restartu
 \t\t\t\t\t\tif (Math.abs(diff) > 0.15) {{
 \t\t\t\t\t\t\tisProgrammaticSeek = true;
 \t\t\t\t\t\t\tp.currentTime(targetTime);
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
 \t\t\t\t\t\t}}
-\t\t\t\t\t}})
-\t\t\t\t\t.catch(function(err) {{
-\t\t\t\t\t\tspinner.style.display = 'none';
-\t\t\t\t\t\talert('Error loading stream: ' + err);
-\t\t\t\t\t}});
+\t\t\t\t\t\tupdateLevels();
+\t\t\t\t\t}}
+\t\t\t\t}};
+
+\t\t\t\taltAudio.addEventListener('playing', onAudioReady, {{ once: true }});
+\t\t\t\tif (!p.paused()) {{
+\t\t\t\t\taltAudio.play().catch(function(e){{}});
+\t\t\t\t}}
 \t\t\t}}
 
-<<<<<<< HEAD
-=======
 \t\t\tp.on('volumechange', function() {{
 \t\t\t\tupdateLevels();
 \t\t\t}});
@@ -446,7 +392,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\t}});
 
 \t\t\tp.on('seeked', function() {{
-\t\t\t\t// Zabráníme nekonečné smyčce: ignorujeme seek vyvolaný interním srovnáním času
 \t\t\t\tif (isProgrammaticSeek) {{
 \t\t\t\t\tisProgrammaticSeek = false;
 \t\t\t\t\treturn;
@@ -456,7 +401,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}}
 \t\t\t}});
 
-\t\t\t// Průběžné jemné dolaďování rychlosti zvuku (lip-sync) bez skákání videa
 \t\t\tsetInterval(function() {{
 \t\t\t\tif (!isAltAudio || p.paused() || altAudio.paused || altAudio.readyState < 2) return;
 
@@ -475,8 +419,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}}
 \t\t\t}}, 500);
 
-\t\t\t// Naplnění výběru zvukových stop do Video.js
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
 \t\t\tif (audioTracksData.length > 1) {{
 \t\t\t\taudioTracksData.forEach(function(t) {{
 \t\t\t\t\tp.audioTracks().addTrack(new videojs.AudioTrack({{
@@ -489,35 +431,19 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}});
 
 \t\t\t\tp.audioTracks().addEventListener('change', function() {{
+\t\t\t\t\tensureAudioGraph();
 \t\t\t\t\tfor (var i = 0; i < p.audioTracks().length; i++) {{
 \t\t\t\t\t\tvar tr = p.audioTracks()[i];
 \t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
 \t\t\t\t\t\t\tcurrentAudioId = tr.id;
-\t\t\t\t\t\t\tvar savedTime = p.currentTime();
-\t\t\t\t\t\t\tvar wasPaused = p.paused();
-
 \t\t\t\t\t\t\tif (tr.id === "0") {{
-<<<<<<< HEAD
-\t\t\t\t\t\t\t\t// Zpět na výchozí stopu (Čeština) - Direct Play
-\t\t\t\t\t\t\t\tp.src({{ src: '/stream?path=' + basePath }});
-\t\t\t\t\t\t\t\tp.one('loadedmetadata', function() {{
-\t\t\t\t\t\t\t\t\tp.currentTime(savedTime);
-\t\t\t\t\t\t\t\t\tif (!wasPaused) p.play();
-\t\t\t\t\t\t\t\t}});
-\t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t// Přepnutí na angličtinu s přesným časem bez PTS chyb
-\t\t\t\t\t\t\t\tloadHlsStream(savedTime);
-=======
-\t\t\t\t\t\t\t\t// Návrat na Češtinu [aac]
 \t\t\t\t\t\t\t\tisAltAudio = false;
 \t\t\t\t\t\t\t\taltAudio.pause();
 \t\t\t\t\t\t\t\taltAudio.removeAttribute('src');
 \t\t\t\t\t\t\t\tupdateLevels();
 \t\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\t\t// Angličtina [eac3]
 \t\t\t\t\t\t\t\tisAltAudio = true;
 \t\t\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
 \t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
 \t\t\t\t\t\t}}
@@ -615,125 +541,10 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        elif path == "/api/start_hls":
-            global active_hls_proc
-            rel_path = query.get("path", [""])[0]
-            track_idx = query.get("track", ["1"])[0]
-            start_t = query.get("t", ["0"])[0]
-
-            if not self.is_safe_path(rel_path):
-                self.send_error(404, "Video not found")
-                return
-
-            full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
-
-            cleanup_active_hls()
-
-            session_dir = os.path.join(HLS_BASE_DIR, "session")
-            shutil.rmtree(session_dir, ignore_errors=True)
-            os.makedirs(session_dir, exist_ok=True)
-
-            m3u8_file = os.path.join(session_dir, "stream.m3u8")
-
-            cmd = ["ffmpeg", "-v", "error", "-y"]
-            try:
-                t_val = float(start_t)
-                if t_val > 0:
-                    cmd.extend(["-ss", str(t_val)])
-            except ValueError:
-                pass
-
-            # ZÁSADNÍ PARAMETRY:
-            # -avoid_negative_ts make_zero srovná časovou osu obrazu i zvuku na nulu (žádný 50minutový rozestup)
-            # discont_start přikáže přehrávači okamžitý start
-            cmd.extend([
-                "-i", full_path,
-                "-map", "0:v:0",
-                "-map", f"0:a:{track_idx}",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-                "-avoid_negative_ts", "make_zero",
-                "-f", "hls",
-                "-hls_time", "3",
-                "-hls_list_size", "8",
-                "-hls_flags", "delete_segments+temp_file+discont_start",
-                "-hls_segment_filename", "seg_%03d.ts",
-                "stream.m3u8"
-            ])
-
-            print(f"[+] Starting in-memory HLS stream (RAM) for track #{track_idx} at {start_t}s...")
-            active_hls_proc = subprocess.Popen(
-                cmd,
-                cwd=session_dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-
-            is_ready = False
-            for _ in range(300):
-                if active_hls_proc.poll() is not None:
-                    print("[!] FFmpeg process terminated early.")
-                    break
-
-                if os.path.exists(m3u8_file) and os.path.getsize(m3u8_file) > 20:
-                    ts_files = [f for f in os.listdir(session_dir) if f.endswith(".ts") and not f.endswith(".tmp")]
-                    if len(ts_files) >= 1:
-                        first_ts = os.path.join(session_dir, ts_files[0])
-                        if os.path.getsize(first_ts) > 100 * 1024:
-                            is_ready = True
-                            break
-                time.sleep(0.1)
-
-            if is_ready:
-                resp = json.dumps({"status": "ready", "url": "/hls/session/stream.m3u8"}).encode("utf-8")
-            else:
-                resp = json.dumps({"status": "error", "message": "Timeout generating stream"}).encode("utf-8")
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
-            return
-
-        elif path.startswith("/hls/"):
-            rel_hls = path[len("/hls/"):].lstrip("/\\")
-            target_file = os.path.abspath(os.path.join(HLS_BASE_DIR, rel_hls))
-
-            if not target_file.startswith(os.path.abspath(HLS_BASE_DIR)) or not os.path.exists(target_file):
-                self.send_error(404, "Segment not found")
-                return
-
-            if target_file.endswith(".tmp"):
-                self.send_error(404, "Segment still writing")
-                return
-
-            if target_file.endswith(".m3u8"):
-                content_type = "application/x-mpegURL"
-            elif target_file.endswith(".ts"):
-                content_type = "video/MP2T"
-            else:
-                content_type = "application/octet-stream"
-
-            try:
-                with open(target_file, "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-                self.end_headers()
-                self.wfile.write(data)
-            except Exception as e:
-                self.send_error(500, str(e))
-            return
-
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Titulky nenalezeny")
+                self.send_error(404, "Subtitles not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -761,22 +572,20 @@ class MediaHandler(BaseHTTPRequestHandler):
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Video nenalezeno")
+                self.send_error(404, "Video not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
             self.handle_range_streaming(full_path)
             return
 
-<<<<<<< HEAD
-=======
         elif path == "/audio_stream":
             rel_path = query.get("path", [""])[0]
             track_idx = query.get("track", ["1"])[0]
             start_t = query.get("t", ["0"])[0]
 
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Audio nenalezeno")
+                self.send_error(404, "Audio not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -823,15 +632,14 @@ class MediaHandler(BaseHTTPRequestHandler):
                         pass
             return
 
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
         else:
-            self.send_error(404, "Nenalezeno")
+            self.send_error(404, "Not Found")
 
     def handle_range_streaming(self, file_path: str):
         try:
             file_size = os.path.getsize(file_path)
         except OSError:
-            self.send_error(404, "Soubor nenalezen")
+            self.send_error(404, "File not found")
             return
 
         mime_type, _ = mimetypes.guess_type(file_path)
@@ -879,8 +687,6 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Content-Length", str(content_length))
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         try:
@@ -898,28 +704,14 @@ class MediaHandler(BaseHTTPRequestHandler):
 
 def run_server():
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    shutil.rmtree(HLS_BASE_DIR, ignore_errors=True)
-    os.makedirs(HLS_BASE_DIR, exist_ok=True)
     print("=== TC-Media Server ===")
-<<<<<<< HEAD
     print(f"Media directory : {MEDIA_DIR}")
-    print(f"HLS memory path : {HLS_BASE_DIR} (RAM)")
     print(f"Running at      : http://{HOST}:{PORT}")
-=======
-    print(f"Složka médií : {MEDIA_DIR}")
-    print(f"Běží na      : http://{HOST}:{PORT}")
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-<<<<<<< HEAD
         print("\nShutting down server...")
-        cleanup_active_hls()
-        shutil.rmtree(HLS_BASE_DIR, ignore_errors=True)
-=======
-        print("\nUkončuji server...")
->>>>>>> parent of f1fbf69 (Update server.py for English localization and features)
         server.server_close()
 
 if __name__ == "__main__":
