@@ -4,9 +4,8 @@ TC-Media Server - Media Library & Video.js Player.
 - Automated detection of subtitles and injection as <track> elements.
 - Audio track discovery via ffprobe (English [eac3], Czech [aac], etc.).
 - Real-time on-the-fly audio streaming with EAC3/AC3 to AAC conversion.
-- Web Audio API integration with fallback for Smart TVs (Samsung/LG/Android TV).
-- Smart TV fix: maps native undefined ("und") tracks to probed labels and indexes.
-- Seamless video/audio synchronization with loop-prevention guards.
+- Smart TV & Mobile compatible dual-stream sync without Web Audio API freezing.
+- Disables native TV track duplication (removes the duplicate 'und' tracks).
 """
 import os
 import sys
@@ -85,7 +84,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
         .video-item { display: inline-flex; flex-direction: column; vertical-align: top; width: 220px; min-height: 235px; margin: 12px; text-align: left; background: #232933; border: 1px solid #3a414c; border-radius: 8px; overflow: hidden; text-decoration: none; color: inherit; transition: transform 0.15s, border-color 0.15s; }
         .video-item:hover { transform: translateY(-3px); border-color: #e54c4c; }
         .video-thumbnail { width: 100%; height: 120px; background: #14171d; display: block; }
-        .video-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
+        .video-thumbnail img { width: 100%; height: 120px; object-fit: cover; }
         .video-details { padding: 12px; flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; }
         .video-details p { margin: 0 0 10px 0; font-weight: 500; font-size: 0.9rem; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
         .play-link { display: inline-block; text-align: center; border: 1px solid #e54c4c; color: #e54c4c; padding: 6px 14px; border-radius: 4px; text-decoration: none; font-size: 0.85rem; font-weight: 600; margin-top: auto; }
@@ -282,19 +281,18 @@ def build_player_page(video_path: str) -> str:
 \t<audio id="altAudio" preload="auto" style="display:none;"></audio>
 \t<script>
 \t\tvar audioTracksData = {audio_tracks_json};
-\t\tvar currentAudioIndex = 0;
+\t\tvar currentAudioId = "0";
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
 \t\tvar altAudio = document.getElementById('altAudio');
 \t\tvar isAltAudio = false;
-
 \t\tvar altAudioBaseTime = 0;
-\t\tvar isProgrammaticSeek = false;
-\t\tvar audioCtx = null;
-\t\tvar videoGain = null;
-\t\tvar isInternalMute = false;
 
 \t\tvar player = videojs('videoPlayer', {{
 \t\t\tcontrols: true,
+\t\t\thtml5: {{
+\t\t\t\tnativeAudioTracks: false,
+\t\t\t\tnativeVideoTracks: false
+\t\t\t}},
 \t\t\tcontrolBar: {{
 \t\t\t\taudioTrackButton: true
 \t\t\t}},
@@ -320,87 +318,45 @@ def build_player_page(video_path: str) -> str:
 \t\t\tvar p = this;
 \t\t\tvar rawVideo = p.el().querySelector('video');
 
-\t\t\tfunction ensureAudioGraph() {{
-\t\t\t\tif (!audioCtx) {{
-\t\t\t\t\ttry {{
-\t\t\t\t\t\taudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-\t\t\t\t\t\tvar src = audioCtx.createMediaElementSource(rawVideo);
-\t\t\t\t\t\tvideoGain = audioCtx.createGain();
-\t\t\t\t\t\tsrc.connect(videoGain);
-\t\t\t\t\t\tvideoGain.connect(audioCtx.destination);
-\t\t\t\t\t}} catch (e) {{
-\t\t\t\t\t\tvideoGain = null;
-\t\t\t\t\t}}
-\t\t\t\t}}
-\t\t\t\tif (audioCtx && audioCtx.state === 'suspended') {{
-\t\t\t\t\taudioCtx.resume();
-\t\t\t\t}}
-\t\t\t}}
-
 \t\t\tfunction updateLevels() {{
 \t\t\t\tif (isAltAudio) {{
-\t\t\t\t\tif (videoGain) {{
-\t\t\t\t\t\tvideoGain.gain.value = 0;
-\t\t\t\t\t}} else {{
-\t\t\t\t\t\tisInternalMute = true;
-\t\t\t\t\t\trawVideo.muted = true;
-\t\t\t\t\t\tsetTimeout(function() {{ isInternalMute = false; }}, 50);
-\t\t\t\t\t}}
+\t\t\t\t\trawVideo.volume = 0;
 \t\t\t\t\taltAudio.volume = p.volume();
 \t\t\t\t\taltAudio.muted = p.muted();
 \t\t\t\t}} else {{
-\t\t\t\t\tif (videoGain) {{
-\t\t\t\t\t\tvideoGain.gain.value = 1;
-\t\t\t\t\t}} else {{
-\t\t\t\t\t\tisInternalMute = true;
-\t\t\t\t\t\trawVideo.muted = p.muted();
-\t\t\t\t\t\trawVideo.volume = p.volume();
-\t\t\t\t\t\tsetTimeout(function() {{ isInternalMute = false; }}, 50);
-\t\t\t\t\t}}
+\t\t\t\t\trawVideo.volume = p.volume();
+\t\t\t\t\trawVideo.muted = p.muted();
 \t\t\t\t\taltAudio.pause();
 \t\t\t\t}}
 \t\t\t}}
 
 \t\t\tfunction startAltAudioStream(seekTime) {{
 \t\t\t\tif (!isAltAudio) return;
-\t\t\t\tensureAudioGraph();
 
 \t\t\t\tvar targetTime = Math.max(0, seekTime !== undefined ? seekTime : (p.currentTime() || 0));
 \t\t\t\taltAudioBaseTime = targetTime;
 
-\t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioIndex + '&t=' + targetTime;
+\t\t\t\taltAudio.src = '/audio_stream?path=' + basePath + '&track=' + currentAudioId + '&t=' + targetTime;
 \t\t\t\taltAudio.volume = p.volume();
 \t\t\t\taltAudio.muted = p.muted();
 \t\t\t\taltAudio.playbackRate = p.playbackRate();
 \t\t\t\taltAudio.load();
 
-\t\t\t\tvar onAudioReady = function() {{
-\t\t\t\t\taltAudio.removeEventListener('playing', onAudioReady);
-\t\t\t\t\tif (isAltAudio) {{
-\t\t\t\t\t\tvar diff = p.currentTime() - targetTime;
-\t\t\t\t\t\tif (Math.abs(diff) > 0.15) {{
-\t\t\t\t\t\t\tisProgrammaticSeek = true;
-\t\t\t\t\t\t\tp.currentTime(targetTime);
-\t\t\t\t\t\t}}
-\t\t\t\t\t\tupdateLevels();
-\t\t\t\t\t}}
-\t\t\t\t}};
+\t\t\t\tupdateLevels();
 
-\t\t\t\taltAudio.addEventListener('playing', onAudioReady, {{ once: true }});
 \t\t\t\tif (!p.paused()) {{
 \t\t\t\t\taltAudio.play().catch(function(e){{}});
 \t\t\t\t}}
 \t\t\t}}
 
 \t\t\tp.on('volumechange', function() {{
-\t\t\t\tif (isInternalMute) return;
 \t\t\t\tupdateLevels();
 \t\t\t}});
 
 \t\t\tp.on('play', function() {{
-\t\t\t\tensureAudioGraph();
 \t\t\t\tupdateLevels();
 \t\t\t\tif (isAltAudio && altAudio.src && altAudio.paused) {{
+\t\t\t\t\taltAudio.currentTime = Math.max(0, p.currentTime() - altAudioBaseTime);
 \t\t\t\t\taltAudio.play().catch(function(e){{}});
 \t\t\t\t}}
 \t\t\t}});
@@ -410,10 +366,6 @@ def build_player_page(video_path: str) -> str:
 \t\t\t}});
 
 \t\t\tp.on('seeked', function() {{
-\t\t\t\tif (isProgrammaticSeek) {{
-\t\t\t\t\tisProgrammaticSeek = false;
-\t\t\t\t\treturn;
-\t\t\t\t}}
 \t\t\t\tif (isAltAudio) {{
 \t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t}}
@@ -426,65 +378,47 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\tvar currentVideoTime = p.currentTime();
 \t\t\t\tvar diff = currentVideoTime - currentAudioTime;
 
-\t\t\t\tif (Math.abs(diff) < 0.08) {{
+\t\t\t\tif (Math.abs(diff) < 0.12) {{
 \t\t\t\t\taltAudio.playbackRate = p.playbackRate();
 \t\t\t\t}}
-\t\t\t\telse if (diff > 0.08 && diff < 0.6) {{
-\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 1.05;
+\t\t\t\telse if (diff > 0.12 && diff < 0.8) {{
+\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 1.08;
 \t\t\t\t}}
-\t\t\t\telse if (diff < -0.08 && diff > -0.6) {{
-\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 0.95;
+\t\t\t\telse if (diff < -0.12 && diff > -0.8) {{
+\t\t\t\t\taltAudio.playbackRate = p.playbackRate() * 0.92;
+\t\t\t\t}}
+\t\t\t\telse if (Math.abs(diff) >= 0.8) {{
+\t\t\t\t\taltAudio.currentTime = Math.max(0, currentVideoTime - altAudioBaseTime);
 \t\t\t\t}}
 \t\t\t}}, 500);
 
-\t\t\tfunction syncTracks() {{
+\t\t\tif (audioTracksData.length > 1) {{
 \t\t\t\tvar tracks = p.audioTracks();
-\t\t\t\tif (!tracks) return;
+\t\t\t\taudioTracksData.forEach(function(t) {{
+\t\t\t\t\ttracks.addTrack(new videojs.AudioTrack({{
+\t\t\t\t\t\tid: t.id,
+\t\t\t\t\t\tkind: 'alternative',
+\t\t\t\t\t\tlabel: t.label,
+\t\t\t\t\t\tlanguage: t.lang,
+\t\t\t\t\t\tenabled: t.default
+\t\t\t\t\t}}));
+\t\t\t\t}});
 
-\t\t\t\tif (tracks.length > 0) {{
-\t\t\t\t\tfor (var i = 0; i < tracks.length; i++) {{
-\t\t\t\t\t\tif (audioTracksData[i]) {{
-\t\t\t\t\t\t\ttracks[i].label = audioTracksData[i].label;
-\t\t\t\t\t\t}}
-\t\t\t\t\t}}
-\t\t\t\t}} else if (audioTracksData.length > 1) {{
-\t\t\t\t\taudioTracksData.forEach(function(t) {{
-\t\t\t\t\t\ttracks.addTrack(new videojs.AudioTrack({{
-\t\t\t\t\t\t\tid: t.id,
-\t\t\t\t\t\t\tkind: 'alternative',
-\t\t\t\t\t\t\tlabel: t.label,
-\t\t\t\t\t\t\tlanguage: t.lang,
-\t\t\t\t\t\t\tenabled: t.default
-\t\t\t\t\t\t}}));
-\t\t\t\t\t}});
-\t\t\t\t}}
-\t\t\t}}
-
-\t\t\tp.on('loadedmetadata', syncTracks);
-\t\t\tsyncTracks();
-
-\t\t\tvar tracks = p.audioTracks();
-\t\t\tif (tracks) {{
 \t\t\t\ttracks.addEventListener('change', function() {{
-\t\t\t\t\tensureAudioGraph();
-\t\t\t\t\tvar selectedIdx = -1;
 \t\t\t\t\tfor (var i = 0; i < tracks.length; i++) {{
-\t\t\t\t\t\tif (tracks[i].enabled) {{
-\t\t\t\t\t\t\tselectedIdx = i;
+\t\t\t\t\t\tvar tr = tracks[i];
+\t\t\t\t\t\tif (tr.enabled && tr.id !== currentAudioId) {{
+\t\t\t\t\t\t\tcurrentAudioId = tr.id;
+\t\t\t\t\t\t\tif (tr.id === "0") {{
+\t\t\t\t\t\t\t\tisAltAudio = false;
+\t\t\t\t\t\t\t\taltAudio.pause();
+\t\t\t\t\t\t\t\taltAudio.removeAttribute('src');
+\t\t\t\t\t\t\t\tupdateLevels();
+\t\t\t\t\t\t\t}} else {{
+\t\t\t\t\t\t\t\tisAltAudio = true;
+\t\t\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
+\t\t\t\t\t\t\t}}
 \t\t\t\t\t\t\tbreak;
-\t\t\t\t\t\t}}
-\t\t\t\t\t}}
-
-\t\t\t\t\tif (selectedIdx !== -1 && selectedIdx !== currentAudioIndex) {{
-\t\t\t\t\t\tcurrentAudioIndex = selectedIdx;
-\t\t\t\t\t\tif (currentAudioIndex === 0) {{
-\t\t\t\t\t\t\tisAltAudio = false;
-\t\t\t\t\t\t\taltAudio.pause();
-\t\t\t\t\t\t\taltAudio.removeAttribute('src');
-\t\t\t\t\t\t\tupdateLevels();
-\t\t\t\t\t\t}} else {{
-\t\t\t\t\t\t\tisAltAudio = true;
-\t\t\t\t\t\t\tstartAltAudioStream(p.currentTime());
 \t\t\t\t\t\t}}
 \t\t\t\t\t}}
 \t\t\t\t}});
