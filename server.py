@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 TC-Media Server - Media Library & Video.js Player.
+- Pre-selection of audio track directly in the Library UI (with Auto-Czech/Slovak selection).
 - Automated detection of subtitles and injection as <track> elements.
-- Audio track discovery via ffprobe (English [eac3], Czech [aac], etc.).
+- Audio track discovery via ffprobe (cached in-memory for fast library browsing).
 - Real-time on-the-fly audio streaming with EAC3/AC3 to AAC conversion.
-- Smart TV & Mobile compatible dual-stream sync without Web Audio API freezing.
-- Disables native TV track duplication (removes the duplicate 'und' tracks).
+- Rock-solid Smart TV & Mobile playback from 0:00 without in-flight switching freeze.
 """
 import os
 import sys
@@ -40,6 +40,9 @@ LANG_MAP = {
     "pol": "Polish", "pl": "Polish",
     "und": "Undefined"
 }
+
+# Cache pro audio stopy, aby ffprobe nebrzdil načítání knihovny
+AUDIO_CACHE = {}
 
 mimetypes.init()
 mimetypes.add_type("video/mp4", ".mp4")
@@ -81,13 +84,15 @@ LIBRARY_HTML = """<!DOCTYPE html>
         .url-form button { padding: 12px 22px; background: #e54c4c; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
         .url-form button:hover { background: #c93a3a; }
         .video-list { text-align: center; }
-        .video-item { display: inline-flex; flex-direction: column; vertical-align: top; width: 220px; min-height: 235px; margin: 12px; text-align: left; background: #232933; border: 1px solid #3a414c; border-radius: 8px; overflow: hidden; text-decoration: none; color: inherit; transition: transform 0.15s, border-color 0.15s; }
+        .video-item { display: inline-flex; flex-direction: column; vertical-align: top; width: 235px; min-height: 270px; margin: 12px; text-align: left; background: #232933; border: 1px solid #3a414c; border-radius: 8px; overflow: hidden; text-decoration: none; color: inherit; transition: transform 0.15s, border-color 0.15s; }
         .video-item:hover { transform: translateY(-3px); border-color: #e54c4c; }
         .video-thumbnail { width: 100%; height: 120px; background: #14171d; display: block; }
-        .video-thumbnail img { width: 100%; height: 120px; object-fit: cover; }
+        .video-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
         .video-details { padding: 12px; flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; }
         .video-details p { margin: 0 0 10px 0; font-weight: 500; font-size: 0.9rem; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-        .play-link { display: inline-block; text-align: center; border: 1px solid #e54c4c; color: #e54c4c; padding: 6px 14px; border-radius: 4px; text-decoration: none; font-size: 0.85rem; font-weight: 600; margin-top: auto; }
+        .audio-picker { width: 100%; margin-bottom: 12px; padding: 6px; background: #1e242c; color: #f0f0f0; border: 1px solid #3a414c; border-radius: 4px; font-size: 0.85rem; outline: none; cursor: pointer; }
+        .audio-picker:focus { border-color: #e54c4c; }
+        .play-link { display: block; text-align: center; border: 1px solid #e54c4c; color: #e54c4c; padding: 8px 14px; border-radius: 4px; text-decoration: none; font-size: 0.9rem; font-weight: 600; cursor: pointer; }
         .video-item:hover .play-link { background: #e54c4c; color: #fff; }
         .loading { text-align: center; color: #888; margin: 30px 0; }
     </style>
@@ -118,16 +123,39 @@ LIBRARY_HTML = """<!DOCTYPE html>
                 .then(data => {
                     if (data.length > 0) {
                         data.forEach(v => {
-                            var item = document.createElement('a');
+                            var item = document.createElement('div');
                             item.className = 'video-item';
-                            item.href = '/player?video=' + encodeURIComponent(v.path);
-                            item.target = '_blank';
+
+                            var optionsHtml = '';
+                            if (v.tracks && v.tracks.length > 0) {
+                                v.tracks.forEach(t => {
+                                    var sel = t.selected ? ' selected' : '';
+                                    optionsHtml += '<option value="' + t.id + '"' + sel + '>' + t.label + '</option>';
+                                });
+                            } else {
+                                optionsHtml = '<option value="0">Default Audio</option>';
+                            }
+
                             item.innerHTML = 
                                 '<div class="video-thumbnail"><img src="' + v.thumbnail + '"></div>' +
                                 '<div class="video-details">' +
                                     '<p title="' + v.title + '">' + v.title + '</p>' +
-                                    '<div class="play-link">Play ↗</div>' +
+                                    '<div>' +
+                                        '<select class="audio-picker">' + optionsHtml + '</select>' +
+                                        '<a class="play-link" target="_blank">Play ↗</a>' +
+                                    '</div>' +
                                 '</div>';
+
+                            var select = item.querySelector('.audio-picker');
+                            var playLink = item.querySelector('.play-link');
+
+                            function updateLink() {
+                                var track = select.value;
+                                playLink.href = '/player?video=' + encodeURIComponent(v.path) + '&audio=' + track;
+                            }
+                            select.addEventListener('change', updateLink);
+                            updateLink();
+
                             list.appendChild(item);
                         });
                         page++;
@@ -200,6 +228,9 @@ def find_subtitles_in_dir(video_rel_path: str):
     return subtitles
 
 def get_audio_tracks(video_rel_path: str):
+    if video_rel_path in AUDIO_CACHE:
+        return AUDIO_CACHE[video_rel_path]
+
     if not shutil.which("ffprobe"):
         return []
 
@@ -222,6 +253,7 @@ def get_audio_tracks(video_rel_path: str):
         data = json.loads(res.stdout)
         streams = data.get("streams", [])
         tracks = []
+        has_cz = False
 
         for i, s in enumerate(streams):
             tags = s.get("tags") or {}
@@ -238,19 +270,34 @@ def get_audio_tracks(video_rel_path: str):
             if codec:
                 label += f" [{codec}]"
 
+            is_czech_or_slovak = raw_lang in ("cze", "ces", "cs", "slo", "slk", "sk")
+            if is_czech_or_slovak:
+                has_cz = True
+
             tracks.append({
                 "id": str(i),
                 "label": label,
                 "lang": raw_lang or "und",
-                "default": (i == 0)
+                "is_cz": is_czech_or_slovak,
+                "selected": False
             })
 
+        # Automaticky předvybrat češtinu/slovenštinu, pokud v souboru existuje
+        if has_cz:
+            for t in tracks:
+                if t["is_cz"]:
+                    t["selected"] = True
+                    break
+        elif tracks:
+            tracks[0]["selected"] = True
+
+        AUDIO_CACHE[video_rel_path] = tracks
         return tracks
     except Exception as e:
         print(f"[!] Error detecting audio tracks: {e}")
         return []
 
-def build_player_page(video_path: str) -> str:
+def build_player_page(video_path: str, initial_audio: str = "0") -> str:
     file_name = os.path.basename(video_path) if video_path else "Player"
     stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
 
@@ -265,6 +312,11 @@ def build_player_page(video_path: str) -> str:
 
     tracks_html = "\n".join(track_tags)
     audio_tracks = get_audio_tracks(video_path) if video_path else []
+
+    # Označíme předvybranou stopu podle parametru z knihovny
+    for t in audio_tracks:
+        t["default"] = (t["id"] == str(initial_audio))
+
     audio_tracks_json = json.dumps(audio_tracks)
     buffer_inject = get_buffer_content()
 
@@ -281,10 +333,10 @@ def build_player_page(video_path: str) -> str:
 \t<audio id="altAudio" preload="auto" style="display:none;"></audio>
 \t<script>
 \t\tvar audioTracksData = {audio_tracks_json};
-\t\tvar currentAudioId = "0";
+\t\tvar currentAudioId = "{initial_audio}";
 \t\tvar basePath = "{urllib.parse.quote(video_path)}";
 \t\tvar altAudio = document.getElementById('altAudio');
-\t\tvar isAltAudio = false;
+\t\tvar isAltAudio = (currentAudioId !== "0");
 \t\tvar altAudioBaseTime = 0;
 
 \t\tvar player = videojs('videoPlayer', {{
@@ -349,6 +401,12 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}}
 \t\t\t}}
 
+\t\t\t// Pokud uživatel vybral stopu předem v knihovně, inicializujeme ji ihned
+\t\t\tif (isAltAudio) {{
+\t\t\t\trawVideo.volume = 0;
+\t\t\t\tstartAltAudioStream(0);
+\t\t\t}}
+
 \t\t\tp.on('volumechange', function() {{
 \t\t\t\tupdateLevels();
 \t\t\t}});
@@ -371,6 +429,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t}}
 \t\t\t}});
 
+\t\t\t// Jemné srovnávání synchronizace audia bez zásahu do videa
 \t\t\tsetInterval(function() {{
 \t\t\t\tif (!isAltAudio || p.paused() || altAudio.paused || altAudio.readyState < 2) return;
 
@@ -400,7 +459,7 @@ def build_player_page(video_path: str) -> str:
 \t\t\t\t\t\tkind: 'alternative',
 \t\t\t\t\t\tlabel: t.label,
 \t\t\t\t\t\tlanguage: t.lang,
-\t\t\t\t\t\tenabled: t.default
+\t\t\t\t\t\tenabled: (t.id === currentAudioId)
 \t\t\t\t\t}}));
 \t\t\t\t}});
 
@@ -461,7 +520,8 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         elif path == "/player":
             v_path = query.get("video", [""])[0]
-            html = build_player_page(v_path)
+            audio_track = query.get("audio", ["0"])[0]
+            html = build_player_page(v_path, initial_audio=audio_track)
             data = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -496,15 +556,16 @@ class MediaHandler(BaseHTTPRequestHandler):
                 page, limit = 1, 20
 
             paged = filtered[(page - 1) * limit : page * limit]
-            result = [
-                {
+            result = []
+            for v in paged:
+                tracks = get_audio_tracks(v["path"])
+                result.append({
                     "title": v["name"],
                     "path": v["path"],
                     "dir": v["dir"],
-                    "thumbnail": DEFAULT_THUMBNAIL
-                }
-                for v in paged
-            ]
+                    "thumbnail": DEFAULT_THUMBNAIL,
+                    "tracks": tracks
+                })
 
             data = json.dumps(result).encode("utf-8")
             self.send_response(200)
