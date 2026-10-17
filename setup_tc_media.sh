@@ -1,53 +1,72 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# TC-Media Server - Installation & Setup Script
-# Features: Python 3, qBittorrent-nox, and FFmpeg (ffprobe) for Linux / Raspberry Pi
+# TC-Media Server - Automated Setup & Deployment Script
 # ==============================================================================
 
 set -e
 
-# Root privilege check
+# Kontrola root oprávnění (sudo)
 if [ "$EUID" -ne 0 ]; then
-    echo "[-] This script must be run as root (e.g. sudo ./setup_tc_media.sh)"
+    echo "[!] Spusťte prosím skript s právy root (např. sudo ./setup_tc_media.sh)"
     exit 1
 fi
 
-# Detect actual user and script directory
-ACTUAL_USER="${SUDO_USER:-$USER}"
+REAL_USER="${SUDO_USER:-$USER}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEDIA_DIR="/dlna"
 
-echo "=================================================="
-echo "         TC-Media Server Setup Script             "
-echo "=================================================="
-echo "[i] User             : ${ACTUAL_USER}"
-echo "[i] Repository path  : ${SCRIPT_DIR}"
-echo "[i] Media directory  : ${MEDIA_DIR}"
-echo "--------------------------------------------------"
+echo "=============================================="
+echo "    TC-Media Server - Installation Script"
+echo "=============================================="
+echo "[+] Detected user     : $REAL_USER"
+echo "[+] Script directory  : $SCRIPT_DIR"
 
-# 1. Update repositories and install required packages
-echo "[+] Updating package list and installing dependencies (python3, qbittorrent-nox, ffmpeg)..."
+# 1. Aktualizace a instalace všech potřebných balíčků
+echo "[+] Updating repositories and installing packages..."
 apt-get update
-apt-get install -y python3 qbittorrent-nox ffmpeg
+apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-evdev \
+    ffmpeg \
+    qbittorrent-nox \
+    cec-utils
 
-# 2. Setup shared media folder (/dlna)
-echo "[+] Configuring media directory: ${MEDIA_DIR}..."
-mkdir -p "${MEDIA_DIR}"
-chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "${MEDIA_DIR}"
-chmod -R 777 "${MEDIA_DIR}"
+# 2. Konfigurace adresáře pro média
+echo "[+] Configuring media directory: $MEDIA_DIR..."
+mkdir -p "$MEDIA_DIR"
+chown -R "$REAL_USER:$REAL_USER" "$MEDIA_DIR"
+chmod -R 775 "$MEDIA_DIR"
 
-# 3. Create systemd service for TC-Media Web Player
+# 3. Konfigurace HDMI-CEC a virtuální myši (uinput)
+echo "[+] Configuring HDMI-CEC & uinput permissions..."
+modprobe uinput || true
+echo "uinput" > /etc/modules-load.d/uinput.conf
+
+cat << 'EOF' > /etc/udev/rules.d/99-uinput.rules
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+EOF
+
+udevadm control --reload-rules || true
+udevadm trigger || true
+
+# Přidání uživatele do multimediálních a vstupních skupin
+usermod -a -G audio,video,input,render "$REAL_USER" || true
+
+# 4. Vytvoření systemd služby pro TC-Media Player
 echo "[+] Creating systemd service: tc-media-player.service..."
-cat <<EOF > /etc/systemd/system/tc-media-player.service
+cat << EOF > /etc/systemd/system/tc-media-player.service
 [Unit]
-Description=TC-Media Server (Web Video Player)
+Description=TC-Media Video Player & CEC Daemon
 After=network.target
 
 [Service]
 Type=simple
-User=${ACTUAL_USER}
-WorkingDirectory=${SCRIPT_DIR}
-ExecStart=/usr/bin/python3 ${SCRIPT_DIR}/server.py ${MEDIA_DIR}
+User=$REAL_USER
+Group=$REAL_USER
+SupplementaryGroups=input video audio render
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=/usr/bin/python3 $SCRIPT_DIR/server.py $MEDIA_DIR
 Restart=always
 RestartSec=3
 
@@ -55,43 +74,44 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-# 4. Create systemd service for qBittorrent daemon
+# 5. Vytvoření systemd služby pro qBittorrent-nox
 echo "[+] Creating systemd service: qbittorrent.service..."
-cat <<EOF > /etc/systemd/system/qbittorrent.service
+cat << EOF > /etc/systemd/system/qbittorrent.service
 [Unit]
-Description=qBittorrent Headless Daemon
+Description=qBittorrent-nox Headless Client
 After=network.target
 
 [Service]
-Type=forking
-User=${ACTUAL_USER}
-ExecStart=/usr/bin/qbittorrent-nox -d --webui-port=8080
-Restart=on-failure
-RestartSec=5
+Type=simple
+User=$REAL_USER
+Group=$REAL_USER
+ExecStart=/usr/bin/qbittorrent-nox
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 5. Reload systemd and start services
+# 6. Znovunačtení služeb a jejich spuštění
 echo "[+] Reloading daemon and starting services..."
 systemctl daemon-reload
+systemctl enable --now tc-media-player.service
+systemctl enable --now qbittorrent.service
 
-systemctl enable tc-media-player.service
-systemctl restart tc-media-player.service
+# Zjištění primární IP adresy zařízení
+IP_ADDR=$(hostname -I | awk '{print $1}')
+if [ -z "$IP_ADDR" ]; then
+    IP_ADDR="127.0.0.1"
+fi
 
-systemctl enable qbittorrent.service
-systemctl restart qbittorrent.service
-
-# 6. Retrieve local IP address
-LOCAL_IP=$(hostname -I | awk '{print $1}')
-
-echo "=================================================="
-echo "       Installation Completed Successfully!       "
-echo "=================================================="
-echo "Web Video Player : http://${LOCAL_IP}:5000"
-echo "qBittorrent WebUI: http://${LOCAL_IP}:8080"
-echo "Media directory  : ${MEDIA_DIR}"
+echo "=============================================="
+echo "        Installation Completed Successfully!"
+echo "=============================================="
+echo "Web Video Player : http://${IP_ADDR}:5000"
+echo "qBittorrent WebUI: http://${IP_ADDR}:8080"
+echo "Media directory  : $MEDIA_DIR"
 echo ""
-echo "Audio support: FFmpeg and ffprobe are ready."
-echo "=================================================="
+echo "Audio support    : FFmpeg and ffprobe are ready."
+echo "Remote support   : HDMI-CEC TV virtual mouse enabled."
+echo "=============================================="
