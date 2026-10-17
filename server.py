@@ -6,12 +6,15 @@ TC-Media Server - Media Library & Video.js Player.
 - Real-time on-the-fly audio streaming with EAC3/AC3 to AAC conversion.
 - Web Audio API integration for independent volume control.
 - Seamless video/audio synchronization with loop-prevention guards.
+- Integrated HDMI-CEC virtual mouse daemon for TV remote navigation.
 """
 import os
 import sys
 import re
 import json
+import time
 import shutil
+import threading
 import subprocess
 import mimetypes
 import urllib.parse
@@ -460,6 +463,99 @@ def convert_srt_to_vtt(srt_text: str) -> str:
     converted = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', srt_text)
     return vtt + converted
 
+def start_cec_mouse_daemon():
+    """
+    Spustí v daemon vlákně odposlech HDMI-CEC signálů z dálkového TV ovladače
+    a transformuje je na pohyby a kliknutí virtuální myši.
+    Pokud cec-client nebo evdev není přítomen, server normálně pokračuje bez chyby.
+    """
+    if not shutil.which("cec-client"):
+        print("[CEC] 'cec-client' nebyl nalezen. HDMI-CEC ovládání zůstává neaktivní.")
+        return
+
+    try:
+        from evdev import UInput, ecodes as e
+    except ImportError:
+        print("[CEC] Knihovna 'python3-evdev' není nainstalována. HDMI-CEC ovládání je neaktivní.")
+        return
+
+    def cec_worker():
+        try:
+            capabilities = {
+                e.EV_REL: [e.REL_X, e.REL_Y],
+                e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.KEY_SPACE]
+            }
+            ui = UInput(capabilities, name="TC-Media-CEC-Mouse")
+        except Exception as ex:
+            print(f"[CEC] Nelze vytvořit uinput zařízení: {ex}")
+            print("[CEC] Ujistěte se, že modul uinput je načten ('sudo modprobe uinput') s právy pro uinput.")
+            return
+
+        print("[CEC] HDMI-CEC virtuální myš byla úspěšně aktivována.")
+        cmd = ["cec-client", "-d", "1"]
+        pattern = re.compile(r"key pressed:\s*([a-zA-Z0-9_\-]+)", re.IGNORECASE)
+        step = 30  # Počet pixelů posunu na jeden stisk šipky
+
+        while True:
+            proc = None
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                for line in proc.stdout:
+                    match = pattern.search(line)
+                    if match:
+                        key = match.group(1).lower()
+
+                        # Pohyby kurzoru myši
+                        if key == "up":
+                            ui.write(e.EV_REL, e.REL_Y, -step)
+                            ui.syn()
+                        elif key == "down":
+                            ui.write(e.EV_REL, e.REL_Y, step)
+                            ui.syn()
+                        elif key == "left":
+                            ui.write(e.EV_REL, e.REL_X, -step)
+                            ui.syn()
+                        elif key == "right":
+                            ui.write(e.EV_REL, e.REL_X, step)
+                            ui.syn()
+
+                        # Levý klik (OK / Select / Enter)
+                        elif key in ("select", "enter"):
+                            ui.write(e.EV_KEY, e.BTN_LEFT, 1)
+                            ui.syn()
+                            time.sleep(0.08)
+                            ui.write(e.EV_KEY, e.BTN_LEFT, 0)
+                            ui.syn()
+
+                        # Pravý klik (Zpět / Exit / Return)
+                        elif key in ("return", "exit", "back"):
+                            ui.write(e.EV_KEY, e.BTN_RIGHT, 1)
+                            ui.syn()
+                            time.sleep(0.08)
+                            ui.write(e.EV_KEY, e.BTN_RIGHT, 0)
+                            ui.syn()
+
+                        # Pozastavení / spuštění videa (Play / Pause -> mezerník)
+                        elif key in ("play", "pause"):
+                            ui.write(e.EV_KEY, e.KEY_SPACE, 1)
+                            ui.syn()
+                            time.sleep(0.08)
+                            ui.write(e.EV_KEY, e.KEY_SPACE, 0)
+                            ui.syn()
+
+            except Exception as err:
+                print(f"[CEC] Chyba v CEC smyčce: {err}")
+                time.sleep(5)
+            finally:
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+
+    t = threading.Thread(target=cec_worker, daemon=True)
+    t.start()
+
 class MediaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -707,6 +803,10 @@ def run_server():
     print("=== TC-Media Server ===")
     print(f"Media directory : {MEDIA_DIR}")
     print(f"Running at      : http://{HOST}:{PORT}")
+
+    # Spustí HDMI-CEC ovládání myši na pozadí
+    start_cec_mouse_daemon()
+
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
         server.serve_forever()
