@@ -66,6 +66,15 @@ sudo chmod +x setup_tc_media.sh
 sudo ./setup_tc_media.sh
 ```
 
+### Quick Update / Reinstall
+
+To quickly update to the latest version and apply changes:
+
+```bash
+cd tc-media-server
+git fetch origin && git reset --hard origin/main && sudo bash ./setup_tc_media.sh
+```
+
 The setup script will automatically:
 1. Install required packages: `python3`, `python3-requests`, `python3-tk`, `ffmpeg`, and `qbittorrent-nox`.
 2. Prepare the media directory at `/dlna` and set appropriate read/write permissions.
