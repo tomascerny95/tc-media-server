@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
 """
 TC-Media Server - Media Library & Clean Video.js Player.
-- Designed for clean Video.js (works with pluginBuffer.html).
-- Native hotkeys, touch gestures (double-tap seek with bubbles), and Smart TV remote support.
+- Clean Video.js integration via pluginBuffer.html (no external plugin deps).
+- MRU video tracking via 'urlFolder' (recently watched videos bumped to the top).
+- Mid-video thumbnail generation on-demand via ffmpeg into 'imageFolder'.
+- Native touch gestures (double-tap seek + bubbles), PC hotkeys, and Smart TV remote.
 - Video queue mode with automatic progression.
-- Resume playback modal (localStorage).
-- Delete video + associated subtitles functionality.
-- Audio track discovery via ffprobe and on-the-fly transcoding via ffmpeg.
-- Web Audio API integration for independent volume and sync.
+- Resume playback modal with saved position in localStorage.
+- Real-time on-the-fly audio transcoding (EAC3/AC3 to AAC) via ffmpeg + Web Audio API.
 """
 import os
 import sys
 import re
 import json
+import time
 import shutil
+import hashlib
+import threading
 import subprocess
 import mimetypes
 import urllib.parse
+from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-# --- CONFIGURATION ---
+# --- KONFIGURACE A CESTY ---
 HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
-BUFFER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pluginBuffer.html")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BUFFER_FILE = os.path.join(BASE_DIR, "pluginBuffer.html")
+FOLDER_URLS = os.path.join(BASE_DIR, "urlFolder")
+FOLDER_IMAGES = os.path.join(BASE_DIR, "imageFolder")
+
+for d in [MEDIA_DIR, FOLDER_URLS, FOLDER_IMAGES]:
+    os.makedirs(d, exist_ok=True)
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
@@ -50,6 +61,7 @@ mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("video/x-msvideo", ".avi")
 mimetypes.add_type("audio/aac", ".aac")
 mimetypes.add_type("text/vtt", ".vtt")
+mimetypes.add_type("image/jpeg", ".jpg")
 
 FAVICON_BASE64 = (
     "data:image/x-icon;base64,AAABAAYAAAAAAAEAIADqMAAAZgAAAICAAAABACAAKAgBAFAxAABAQAAAAQAgAChCAAB4OQEAMDAAAAEAIACoJQAAoHsBACAgAA"
@@ -67,6 +79,275 @@ THUMBNAIL_SVG = urllib.parse.quote("""<svg xmlns="http://www.w3.org/2000/svg" vi
 </svg>""")
 DEFAULT_THUMBNAIL = f"data:image/svg+xml;utf8,{THUMBNAIL_SVG}"
 
+THUMB_LOCK = threading.Lock()
+
+# ==============================================================================
+# POMOCNÉ FUNKCE: ID, HISTORIE V URLFOLDER, NÁHLEDY V IMAGEFOLDER
+# ==============================================================================
+def get_video_id(rel_path: str) -> str:
+    """Vytvoří bezpečný MD5 hash z relativní cesty videa."""
+    return hashlib.md5(rel_path.strip("/\\").encode("utf-8")).hexdigest()
+
+def bump_video_to_top(rel_path: str):
+    """Uloží nebo aktualizuje záznam o přehrání videa do složky urlFolder."""
+    vid_id = get_video_id(rel_path)
+    now_ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    clean_name = re.sub(r'[\\/*?:"<>|]', "", os.path.basename(rel_path))[:40]
+    new_filename = f"{now_ts}_{vid_id}_{clean_name}.txt"
+    new_path = os.path.join(FOLDER_URLS, new_filename)
+
+    try:
+        # Odstraníme starší záznamy pro toto video z urlFolder
+        for f in os.listdir(FOLDER_URLS):
+            if f.endswith(".txt") and f"_{vid_id}_" in f:
+                try:
+                    os.remove(os.path.join(FOLDER_URLS, f))
+                except Exception:
+                    pass
+
+        with open(new_path, "w", encoding="utf-8") as fp:
+            fp.write(rel_path.strip("/\\") + "\n")
+    except Exception as e:
+        print(f"[!] Chyba zapisu do urlFolder: {e}")
+
+def get_recent_paths_order() -> list:
+    """Vrátí seznam relativních cest seřazených od nejnověji zhlédnutého."""
+    if not os.path.exists(FOLDER_URLS):
+        return []
+    
+    files = [f for f in os.listdir(FOLDER_URLS) if f.endswith(".txt")]
+    files.sort(key=lambda x: os.path.getmtime(os.path.join(FOLDER_URLS, x)), reverse=True)
+    
+    recent_paths = []
+    seen = set()
+    for fname in files:
+        fpath = os.path.join(FOLDER_URLS, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as fp:
+                for line in fp:
+                    p = line.strip()
+                    if p and p not in seen:
+                        recent_paths.append(p)
+                        seen.add(p)
+        except Exception:
+            pass
+    return recent_paths
+
+def get_video_duration_seconds(full_path: str) -> float:
+    """Zjistí délku videa v sekundách pomocí ffprobe."""
+    if not shutil.which("ffprobe"):
+        return 0.0
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            full_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=6)
+        if res.returncode == 0 and res.stdout.strip():
+            return float(res.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
+
+def generate_midpoint_thumbnail(video_rel_path: str) -> str:
+    """Vytvoří snímek přesně uprostřed videa a uloží jej do imageFolder."""
+    vid_id = get_video_id(video_rel_path)
+    thumb_path = os.path.join(FOLDER_IMAGES, f"{vid_id}.jpg")
+
+    if os.path.exists(thumb_path):
+        return thumb_path
+
+    if not shutil.which("ffmpeg"):
+        return ""
+
+    full_video_path = os.path.join(MEDIA_DIR, video_rel_path.lstrip("/\\"))
+    if not os.path.exists(full_video_path):
+        return ""
+
+    with THUMB_LOCK:
+        if os.path.exists(thumb_path):
+            return thumb_path
+
+        duration = get_video_duration_seconds(full_video_path)
+        seek_sec = max(5.0, duration / 2.0) if duration > 10 else 2.0
+
+        tmp_thumb = thumb_path + ".tmp.jpg"
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-ss", str(seek_sec),
+            "-i", full_video_path,
+            "-vframes", "1",
+            "-q:v", "3",
+            "-vf", "scale=360:-1",
+            tmp_thumb
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=12)
+            if res.returncode == 0 and os.path.exists(tmp_thumb) and os.path.getsize(tmp_thumb) > 100:
+                os.replace(tmp_thumb, thumb_path)
+                return thumb_path
+        except Exception as e:
+            print(f"[!] Chyba generovani nahledu pro {video_rel_path}: {e}")
+        finally:
+            if os.path.exists(tmp_thumb):
+                try:
+                    os.remove(tmp_thumb)
+                except Exception:
+                    pass
+
+    return ""
+
+def get_buffer_content() -> str:
+    """Načte pluginBuffer.html (vygenerovaný skriptem plugin_updater_gui.py)."""
+    search_paths = [
+        BUFFER_FILE,
+        os.path.join(BASE_DIR, "buffer.html")
+    ]
+    for p in search_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+            except Exception as e:
+                print(f"[!] Chyba čtení {p}: {e}")
+    return ""
+
+def format_sub_label(filename: str) -> str:
+    base = os.path.splitext(filename)[0]
+    tokens = re.split(r'[-_. ]+', base.lower())
+    for t in tokens:
+        if t in LANG_MAP:
+            return f"{LANG_MAP[t]} ({t})"
+    return filename
+
+def find_subtitles_in_dir(video_rel_path: str):
+    video_full_path = os.path.join(MEDIA_DIR, video_rel_path.lstrip("/\\"))
+    folder = os.path.dirname(video_full_path)
+    video_base = os.path.splitext(os.path.basename(video_full_path))[0].lower()
+
+    subtitles = []
+    if not os.path.isdir(folder):
+        return subtitles
+
+    for f in sorted(os.listdir(folder)):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in SUBTITLE_EXTENSIONS:
+            sub_full = os.path.join(folder, f)
+            sub_rel = os.path.relpath(sub_full, MEDIA_DIR)
+            sub_base = os.path.splitext(f)[0].lower()
+            is_matched = (sub_base == video_base or sub_base.startswith(video_base))
+            subtitles.append({
+                "name": format_sub_label(f),
+                "path": sub_rel,
+                "default": is_matched
+            })
+
+    if subtitles and not any(s["default"] for s in subtitles):
+        subtitles[0]["default"] = True
+
+    return subtitles
+
+def get_audio_tracks(video_rel_path: str):
+    if not shutil.which("ffprobe"):
+        return []
+
+    video_full_path = os.path.join(MEDIA_DIR, video_rel_path.lstrip("/\\"))
+    if not os.path.exists(video_full_path):
+        return []
+
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index:stream_tags=language,title:stream=codec_name",
+            "-of", "json",
+            video_full_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res.returncode != 0:
+            return []
+
+        data = json.loads(res.stdout)
+        streams = data.get("streams", [])
+        tracks = []
+
+        for i, s in enumerate(streams):
+            tags = s.get("tags") or {}
+            raw_lang = (tags.get("language") or tags.get("LANGUAGE") or "").lower()
+            title = tags.get("title") or tags.get("TITLE") or ""
+            codec = s.get("codec_name", "")
+
+            lang_label = LANG_MAP.get(raw_lang, raw_lang.upper() if raw_lang else f"Audio {i+1}")
+            if title and title.lower() != raw_lang:
+                label = f"{lang_label} ({title})"
+            else:
+                label = lang_label
+
+            if codec:
+                label += f" [{codec}]"
+
+            tracks.append({
+                "id": str(i),
+                "label": label,
+                "lang": raw_lang or "und",
+                "default": (i == 0)
+            })
+
+        return tracks
+    except Exception as e:
+        print(f"[!] Error detecting audio tracks: {e}")
+        return []
+
+def delete_video_and_associated_files(rel_path: str):
+    """Smaže video, související titulky, náhled z imageFolder i záznam z urlFolder."""
+    abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
+    vid_id = get_video_id(rel_path)
+
+    # 1. Smazání z urlFolder
+    if os.path.exists(FOLDER_URLS):
+        for f in os.listdir(FOLDER_URLS):
+            if f"_{vid_id}_" in f:
+                try:
+                    os.remove(os.path.join(FOLDER_URLS, f))
+                except Exception:
+                    pass
+
+    # 2. Smazání z imageFolder
+    img_thumb = os.path.join(FOLDER_IMAGES, f"{vid_id}.jpg")
+    if os.path.exists(img_thumb):
+        try:
+            os.remove(img_thumb)
+        except Exception:
+            pass
+
+    # 3. Smazání videa
+    if os.path.exists(abs_path):
+        try:
+            os.remove(abs_path)
+            print(f"[SMAZÁNO] Video: {abs_path}")
+        except Exception as e:
+            print(f"[!] Nelze smazat video {abs_path}: {e}")
+
+    # 4. Smazání souvisejících titulků
+    folder = os.path.dirname(abs_path)
+    base_name = os.path.splitext(os.path.basename(abs_path))[0].lower()
+    if os.path.isdir(folder):
+        for f in os.listdir(folder):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in SUBTITLE_EXTENSIONS:
+                f_base = os.path.splitext(f)[0].lower()
+                if f_base == base_name or f_base.startswith(base_name):
+                    try:
+                        os.remove(os.path.join(folder, f))
+                        print(f"[SMAZÁNO] Související titulky: {f}")
+                    except Exception as e:
+                        print(f"[!] Nelze smazat titulky {f}: {e}")
+
+# ==============================================================================
+# HTML KNIHOVNY VIDEÍ
+# ==============================================================================
 LIBRARY_HTML = """<!DOCTYPE html>
 <html lang="cs">
 <head>
@@ -121,6 +402,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
         var searchInput = document.getElementById('searchInput');
         var queueMode = false;
         var queueList = [];
+        var defaultPlaceholder = '__DEFAULT_THUMB__';
 
         function updateQueueButtonText() {
             var btn = document.getElementById("btnQueue");
@@ -235,12 +517,12 @@ LIBRARY_HTML = """<!DOCTYPE html>
                             });
 
                             var playUrl = '/player?video=' + encodeURIComponent(v.path);
-
                             var safeTitle = escapeHtml(v.title);
+
                             item.innerHTML = 
                                 '<div class="queue-badge"></div>' +
                                 '<a class="video-thumbnail" href="' + playUrl + '">' +
-                                    '<img src="' + v.thumbnail + '">' +
+                                    '<img src="' + v.thumbnail + '" onerror="this.onerror=null;this.src=defaultPlaceholder;" loading="lazy">' +
                                 '</a>' +
                                 '<div class="video-details">' +
                                     '<p title="' + safeTitle + '">' + safeTitle + '</p>' +
@@ -318,107 +600,9 @@ LIBRARY_HTML = """<!DOCTYPE html>
 </html>
 """
 
-def get_buffer_content() -> str:
-    """Načte pluginBuffer.html (vygenerovaný skriptem plugin_updater_gui.py)."""
-    search_paths = [
-        BUFFER_FILE,
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "buffer.html")
-    ]
-    for p in search_paths:
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    return f.read()
-            except Exception as e:
-                print(f"[!] Chyba čtení {p}: {e}")
-    return ""
-
-def format_sub_label(filename: str) -> str:
-    base = os.path.splitext(filename)[0]
-    tokens = re.split(r'[-_. ]+', base.lower())
-    for t in tokens:
-        if t in LANG_MAP:
-            return f"{LANG_MAP[t]} ({t})"
-    return filename
-
-def find_subtitles_in_dir(video_rel_path: str):
-    video_full_path = os.path.join(MEDIA_DIR, video_rel_path.lstrip("/\\"))
-    folder = os.path.dirname(video_full_path)
-    video_base = os.path.splitext(os.path.basename(video_full_path))[0].lower()
-
-    subtitles = []
-    if not os.path.isdir(folder):
-        return subtitles
-
-    for f in sorted(os.listdir(folder)):
-        ext = os.path.splitext(f)[1].lower()
-        if ext in SUBTITLE_EXTENSIONS:
-            sub_full = os.path.join(folder, f)
-            sub_rel = os.path.relpath(sub_full, MEDIA_DIR)
-            sub_base = os.path.splitext(f)[0].lower()
-            is_matched = (sub_base == video_base or sub_base.startswith(video_base))
-            subtitles.append({
-                "name": format_sub_label(f),
-                "path": sub_rel,
-                "default": is_matched
-            })
-
-    if subtitles and not any(s["default"] for s in subtitles):
-        subtitles[0]["default"] = True
-
-    return subtitles
-
-def get_audio_tracks(video_rel_path: str):
-    if not shutil.which("ffprobe"):
-        return []
-
-    video_full_path = os.path.join(MEDIA_DIR, video_rel_path.lstrip("/\\"))
-    if not os.path.exists(video_full_path):
-        return []
-
-    try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=index:stream_tags=language,title:stream=codec_name",
-            "-of", "json",
-            video_full_path
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
-        if res.returncode != 0:
-            return []
-
-        data = json.loads(res.stdout)
-        streams = data.get("streams", [])
-        tracks = []
-
-        for i, s in enumerate(streams):
-            tags = s.get("tags") or {}
-            raw_lang = (tags.get("language") or tags.get("LANGUAGE") or "").lower()
-            title = tags.get("title") or tags.get("TITLE") or ""
-            codec = s.get("codec_name", "")
-
-            lang_label = LANG_MAP.get(raw_lang, raw_lang.upper() if raw_lang else f"Audio {i+1}")
-            if title and title.lower() != raw_lang:
-                label = f"{lang_label} ({title})"
-            else:
-                label = lang_label
-
-            if codec:
-                label += f" [{codec}]"
-
-            tracks.append({
-                "id": str(i),
-                "label": label,
-                "lang": raw_lang or "und",
-                "default": (i == 0)
-            })
-
-        return tracks
-    except Exception as e:
-        print(f"[!] Error detecting audio tracks: {e}")
-        return []
-
+# ==============================================================================
+# HTML STRÁNKA PŘEHRÁVAČE S NATIVNÍM ČISTÝM VIDEO.JS
+# ==============================================================================
 def build_player_page(video_path: str) -> str:
     file_name = os.path.basename(video_path) if video_path else "Přehrávač"
     stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
@@ -946,32 +1130,9 @@ def convert_srt_to_vtt(srt_text: str) -> str:
     converted = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', srt_text)
     return vtt + converted
 
-def delete_video_and_associated_files(rel_path: str):
-    abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
-    if not os.path.exists(abs_path):
-        return
-
-    folder = os.path.dirname(abs_path)
-    base_name = os.path.splitext(os.path.basename(abs_path))[0].lower()
-
-    try:
-        os.remove(abs_path)
-        print(f"[SMAZÁNO] Video: {abs_path}")
-    except Exception as e:
-        print(f"[!] Nelze smazat video {abs_path}: {e}")
-
-    if os.path.isdir(folder):
-        for f in os.listdir(folder):
-            ext = os.path.splitext(f)[1].lower()
-            if ext in SUBTITLE_EXTENSIONS:
-                f_base = os.path.splitext(f)[0].lower()
-                if f_base == base_name or f_base.startswith(base_name):
-                    try:
-                        os.remove(os.path.join(folder, f))
-                        print(f"[SMAZÁNO] Související titulky: {f}")
-                    except Exception as e:
-                        print(f"[!] Nelze smazat titulky {f}: {e}")
-
+# ==============================================================================
+# HTTP HANDLER
+# ==============================================================================
 class MediaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -1013,7 +1174,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
 
         if path in ("/", "/index.html"):
-            html = LIBRARY_HTML.replace("__FAVICON__", FAVICON_BASE64)
+            html = LIBRARY_HTML.replace("__FAVICON__", FAVICON_BASE64).replace("__DEFAULT_THUMB__", DEFAULT_THUMBNAIL)
             data = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1024,6 +1185,9 @@ class MediaHandler(BaseHTTPRequestHandler):
 
         elif path == "/player":
             v_path = query.get("video", [""])[0]
+            if v_path and self.is_safe_path(v_path):
+                bump_video_to_top(v_path)
+
             html = build_player_page(v_path)
             data = html.encode("utf-8")
             self.send_response(200)
@@ -1034,23 +1198,39 @@ class MediaHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/videos":
-            all_videos = []
+            # 1. Projdeme všechny soubory na disku
+            disk_videos = {}
             for root, _, files in os.walk(MEDIA_DIR):
                 for f in sorted(files):
                     ext = os.path.splitext(f)[1].lower()
-                    abs_path = os.path.join(root, f)
-                    rel_path = os.path.relpath(abs_path, MEDIA_DIR)
-                    rel_dir = os.path.relpath(root, MEDIA_DIR)
-                    if rel_dir == ".":
-                        rel_dir = ""
                     if ext in VIDEO_EXTENSIONS:
-                        all_videos.append({"name": f, "path": rel_path, "dir": rel_dir})
+                        abs_path = os.path.join(root, f)
+                        rel_path = os.path.relpath(abs_path, MEDIA_DIR)
+                        rel_dir = os.path.relpath(root, MEDIA_DIR)
+                        if rel_dir == ".":
+                            rel_dir = ""
+                        disk_videos[rel_path] = {"name": f, "path": rel_path, "dir": rel_dir}
 
+            # 2. Seřadíme videa: naposledy sledovaná z urlFolder nahoru, zbytek pod ně
+            recent_paths = get_recent_paths_order()
+            ordered_videos = []
+            seen = set()
+
+            for rp in recent_paths:
+                if rp in disk_videos:
+                    ordered_videos.append(disk_videos[rp])
+                    seen.add(rp)
+
+            for rp, vinfo in sorted(disk_videos.items(), key=lambda x: x[1]["name"].lower()):
+                if rp not in seen:
+                    ordered_videos.append(vinfo)
+
+            # 3. Vyhledávací filtr
             q_str = query.get("q", [""])[0].lower().strip()
             if q_str:
-                filtered = [v for v in all_videos if q_str in v["name"].lower() or q_str in v["dir"].lower()]
+                filtered = [v for v in ordered_videos if q_str in v["name"].lower() or q_str in v["dir"].lower()]
             else:
-                filtered = all_videos
+                filtered = ordered_videos
 
             try:
                 page = int(query.get("page", ["1"])[0])
@@ -1064,7 +1244,7 @@ class MediaHandler(BaseHTTPRequestHandler):
                     "title": v["name"],
                     "path": v["path"],
                     "dir": v["dir"],
-                    "thumbnail": DEFAULT_THUMBNAIL
+                    "thumbnail": f"/images/{get_video_id(v['path'])}.jpg?vpath={urllib.parse.quote(v['path'])}"
                 }
                 for v in paged
             ]
@@ -1077,10 +1257,39 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        elif path.startswith("/images/") and path.endswith(".jpg"):
+            # Obsluha obrázku: pokud neexistuje, ffmpeg vygeneruje snímek z poloviny videa
+            img_filename = os.path.basename(path)
+            target_thumb = os.path.join(FOLDER_IMAGES, img_filename)
+
+            if not os.path.exists(target_thumb):
+                v_rel = query.get("vpath", [""])[0]
+                if v_rel and self.is_safe_path(v_rel):
+                    generate_midpoint_thumbnail(v_rel)
+
+            if os.path.exists(target_thumb):
+                try:
+                    with open(target_thumb, "rb") as f:
+                        img_data = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(img_data)))
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.end_headers()
+                    self.wfile.write(img_data)
+                    return
+                except Exception:
+                    pass
+
+            self.send_response(302)
+            self.send_header("Location", DEFAULT_THUMBNAIL)
+            self.end_headers()
+            return
+
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Subtitles not found")
+                self.send_error(404, "Titulky nenalezeny")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -1108,7 +1317,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Video not found")
+                self.send_error(404, "Video nenalezeno")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -1121,7 +1330,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             start_t = query.get("t", ["0"])[0]
 
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Audio not found")
+                self.send_error(404, "Zvuk nenalezen")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -1175,7 +1384,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         try:
             file_size = os.path.getsize(file_path)
         except OSError:
-            self.send_error(404, "File not found")
+            self.send_error(404, "Soubor nenalezen")
             return
 
         mime_type, _ = mimetypes.guess_type(file_path)
@@ -1239,10 +1448,11 @@ class MediaHandler(BaseHTTPRequestHandler):
             pass
 
 def run_server():
-    os.makedirs(MEDIA_DIR, exist_ok=True)
     print("=== TC-Media Server ===")
-    print(f"Složka médií    : {MEDIA_DIR}")
-    print(f"Server běží na : http://{HOST}:{PORT}")
+    print(f"Knihovna médií : {MEDIA_DIR}")
+    print(f"Historie (MRU) : {FOLDER_URLS}")
+    print(f"Náhledy (střed): {FOLDER_IMAGES}")
+    print(f"Běží na adrese : http://{HOST}:{PORT}")
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
         server.serve_forever()
