@@ -171,7 +171,9 @@ LIBRARY_HTML = """<!DOCTYPE html>
         }
 
         function renderQueueBadges() {
-            document.querySelectorAll(".video-item").forEach(function(el) {
+            var items = document.querySelectorAll(".video-item");
+            for (var i = 0; i < items.length; i++) {
+                var el = items[i];
                 var path = el.getAttribute("data-path");
                 var badge = el.querySelector(".queue-badge");
                 var idx = queueList.indexOf(path);
@@ -182,10 +184,10 @@ LIBRARY_HTML = """<!DOCTYPE html>
                     el.classList.remove("in-queue");
                     badge.textContent = "";
                 }
-            });
+            }
         }
 
-        function deleteVideo(path) {
+        function deleteVideo(path, itemElement) {
             if (!confirm("Opravdu chcete smazat toto video a související titulky z disku?")) return;
             fetch('/api/delete-video', {
                 method: 'POST',
@@ -195,8 +197,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 if (data.status === 'ok') {
-                    var el = document.querySelector('.video-item[data-path="' + CSS.escape(path) + '"]');
-                    if (el) el.remove();
+                    if (itemElement) itemElement.remove();
                     var qIdx = queueList.indexOf(path);
                     if (qIdx > -1) {
                         queueList.splice(qIdx, 1);
@@ -207,7 +208,13 @@ LIBRARY_HTML = """<!DOCTYPE html>
                     alert("Chyba při mazání: " + (data.error || "Neznámá chyba"));
                 }
             })
-            .catch(function() { alert("Chyba komunikace se serverem."); });
+            .catch(function(err) { alert("Chyba komunikace se serverem."); });
+        }
+
+        function escapeHtml(text) {
+            var div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
         function loadVideos() {
@@ -217,38 +224,69 @@ LIBRARY_HTML = """<!DOCTYPE html>
             fetch('/api/videos?page=' + page + '&q=' + encodeURIComponent(query))
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
-                    if (data.length > 0) {
+                    if (data && data.length > 0) {
                         data.forEach(function(v) {
                             var item = document.createElement('div');
                             item.className = 'video-item';
                             item.setAttribute('data-path', v.path);
-                            item.onclick = function(e) { handleVideoCardClick(e, v.path); };
+
+                            item.addEventListener('click', function(e) {
+                                handleVideoCardClick(e, v.path);
+                            });
 
                             var playUrl = '/player?video=' + encodeURIComponent(v.path);
+
+                            var safeTitle = escapeHtml(v.title);
                             item.innerHTML = 
                                 '<div class="queue-badge"></div>' +
-                                '<a class="video-thumbnail" href="' + playUrl + '" onclick="if(queueMode){event.preventDefault();}">' +
+                                '<a class="video-thumbnail" href="' + playUrl + '">' +
                                     '<img src="' + v.thumbnail + '">' +
                                 '</a>' +
                                 '<div class="video-details">' +
-                                    '<p title="' + v.title + '">' + v.title + '</p>' +
+                                    '<p title="' + safeTitle + '">' + safeTitle + '</p>' +
                                     '<div class="video-links">' +
-                                        '<a class="btn-play" href="' + playUrl + '" onclick="if(queueMode){event.preventDefault(); handleVideoCardClick(event, \'' + CSS.escape(v.path) + '\');}">Přehrát</a>' +
-                                        '<button type="button" class="btn-del" onclick="event.stopPropagation(); deleteVideo(\'' + CSS.escape(v.path) + '\')">Smazat</button>' +
+                                        '<a class="btn-play" href="' + playUrl + '">Přehrát</a>' +
+                                        '<button type="button" class="btn-del">Smazat</button>' +
                                     '</div>' +
                                 '</div>';
+
+                            var thumbLink = item.querySelector('.video-thumbnail');
+                            thumbLink.addEventListener('click', function(e) {
+                                if (queueMode) { e.preventDefault(); }
+                            });
+
+                            var playLink = item.querySelector('.btn-play');
+                            playLink.addEventListener('click', function(e) {
+                                if (queueMode) {
+                                    e.preventDefault();
+                                    handleVideoCardClick(e, v.path);
+                                }
+                            });
+
+                            var delBtn = item.querySelector('.btn-del');
+                            delBtn.addEventListener('click', function(e) {
+                                e.stopPropagation();
+                                deleteVideo(v.path, item);
+                            });
+
                             list.appendChild(item);
                         });
                         page++;
                     }
-                    if (data.length < 20) {
+
+                    if (!data || data.length < 20) {
                         finished = true;
-                        loader.textContent = (data.length === 0 && page === 1) ? 'Žádná videa nenalezena.' : 'Všechna videa načtena.';
+                        loader.textContent = (page === 1 && (!data || data.length === 0)) ? 'Žádná videa nenalezena v knihovně.' : 'Všechna videa načtena.';
                     } else {
                         loader.style.display = 'none';
                     }
                     loading = false;
                     renderQueueBadges();
+                })
+                .catch(function(err) {
+                    console.error("Chyba při načítání videí:", err);
+                    loader.textContent = 'Chyba při načítání videí ze serveru.';
+                    loading = false;
                 });
         }
 
@@ -909,7 +947,6 @@ def convert_srt_to_vtt(srt_text: str) -> str:
     return vtt + converted
 
 def delete_video_and_associated_files(rel_path: str):
-    """Smaže video a související titulky (.srt / .vtt) se stejným základem názvu."""
     abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
     if not os.path.exists(abs_path):
         return
