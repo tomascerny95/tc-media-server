@@ -23,7 +23,7 @@ import urllib.parse
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-# --- KONFIGURACE A CESTY ---
+# --- CONFIGURATION & PATHS ---
 HOST = "0.0.0.0"
 PORT = 5000
 MEDIA_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/dlna")
@@ -81,15 +81,10 @@ DEFAULT_THUMBNAIL = f"data:image/svg+xml;utf8,{THUMBNAIL_SVG}"
 
 THUMB_LOCK = threading.Lock()
 
-# ==============================================================================
-# POMOCNÉ FUNKCE: ID, HISTORIE V URLFOLDER, NÁHLEDY V IMAGEFOLDER
-# ==============================================================================
 def get_video_id(rel_path: str) -> str:
-    """Vytvoří bezpečný MD5 hash z relativní cesty videa."""
     return hashlib.md5(rel_path.strip("/\\").encode("utf-8")).hexdigest()
 
 def bump_video_to_top(rel_path: str):
-    """Uloží nebo aktualizuje záznam o přehrání videa do složky urlFolder."""
     vid_id = get_video_id(rel_path)
     now_ts = datetime.now().strftime("%Y%m%d%H%M%S")
     clean_name = re.sub(r'[\\/*?:"<>|]', "", os.path.basename(rel_path))[:40]
@@ -97,21 +92,20 @@ def bump_video_to_top(rel_path: str):
     new_path = os.path.join(FOLDER_URLS, new_filename)
 
     try:
-        # Odstraníme starší záznamy pro toto video z urlFolder
-        for f in os.listdir(FOLDER_URLS):
-            if f.endswith(".txt") and f"_{vid_id}_" in f:
-                try:
-                    os.remove(os.path.join(FOLDER_URLS, f))
-                except Exception:
-                    pass
+        if os.path.exists(FOLDER_URLS):
+            for f in os.listdir(FOLDER_URLS):
+                if f.endswith(".txt") and f"_{vid_id}_" in f:
+                    try:
+                        os.remove(os.path.join(FOLDER_URLS, f))
+                    except Exception:
+                        pass
 
         with open(new_path, "w", encoding="utf-8") as fp:
             fp.write(rel_path.strip("/\\") + "\n")
     except Exception as e:
-        print(f"[!] Chyba zapisu do urlFolder: {e}")
+        print(f"[!] Error recording history to urlFolder: {e}")
 
 def get_recent_paths_order() -> list:
-    """Vrátí seznam relativních cest seřazených od nejnověji zhlédnutého."""
     if not os.path.exists(FOLDER_URLS):
         return []
     
@@ -134,7 +128,6 @@ def get_recent_paths_order() -> list:
     return recent_paths
 
 def get_video_duration_seconds(full_path: str) -> float:
-    """Zjistí délku videa v sekundách pomocí ffprobe."""
     if not shutil.which("ffprobe"):
         return 0.0
     try:
@@ -144,7 +137,7 @@ def get_video_duration_seconds(full_path: str) -> float:
             "-of", "default=noprint_wrappers=1:nokey=1",
             full_path
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=6)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
         if res.returncode == 0 and res.stdout.strip():
             return float(res.stdout.strip())
     except Exception:
@@ -152,7 +145,6 @@ def get_video_duration_seconds(full_path: str) -> float:
     return 0.0
 
 def generate_midpoint_thumbnail(video_rel_path: str) -> str:
-    """Vytvoří snímek přesně uprostřed videa a uloží jej do imageFolder."""
     vid_id = get_video_id(video_rel_path)
     thumb_path = os.path.join(FOLDER_IMAGES, f"{vid_id}.jpg")
 
@@ -175,7 +167,7 @@ def generate_midpoint_thumbnail(video_rel_path: str) -> str:
 
         tmp_thumb = thumb_path + ".tmp.jpg"
         cmd = [
-            "ffmpeg", "-y", "-v", "error",
+            "ffmpeg", "-y", "-nostdin", "-v", "error",
             "-ss", str(seek_sec),
             "-i", full_video_path,
             "-vframes", "1",
@@ -184,12 +176,12 @@ def generate_midpoint_thumbnail(video_rel_path: str) -> str:
             tmp_thumb
         ]
         try:
-            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=12)
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
             if res.returncode == 0 and os.path.exists(tmp_thumb) and os.path.getsize(tmp_thumb) > 100:
                 os.replace(tmp_thumb, thumb_path)
                 return thumb_path
         except Exception as e:
-            print(f"[!] Chyba generovani nahledu pro {video_rel_path}: {e}")
+            print(f"[!] Error generating thumbnail for {video_rel_path}: {e}")
         finally:
             if os.path.exists(tmp_thumb):
                 try:
@@ -200,7 +192,6 @@ def generate_midpoint_thumbnail(video_rel_path: str) -> str:
     return ""
 
 def get_buffer_content() -> str:
-    """Načte pluginBuffer.html (vygenerovaný skriptem plugin_updater_gui.py)."""
     search_paths = [
         BUFFER_FILE,
         os.path.join(BASE_DIR, "buffer.html")
@@ -211,7 +202,7 @@ def get_buffer_content() -> str:
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read()
             except Exception as e:
-                print(f"[!] Chyba čtení {p}: {e}")
+                print(f"[!] Error reading {p}: {e}")
     return ""
 
 def format_sub_label(filename: str) -> str:
@@ -301,11 +292,9 @@ def get_audio_tracks(video_rel_path: str):
         return []
 
 def delete_video_and_associated_files(rel_path: str):
-    """Smaže video, související titulky, náhled z imageFolder i záznam z urlFolder."""
     abs_path = os.path.abspath(os.path.join(MEDIA_DIR, rel_path.lstrip("/\\")))
     vid_id = get_video_id(rel_path)
 
-    # 1. Smazání z urlFolder
     if os.path.exists(FOLDER_URLS):
         for f in os.listdir(FOLDER_URLS):
             if f"_{vid_id}_" in f:
@@ -314,7 +303,6 @@ def delete_video_and_associated_files(rel_path: str):
                 except Exception:
                     pass
 
-    # 2. Smazání z imageFolder
     img_thumb = os.path.join(FOLDER_IMAGES, f"{vid_id}.jpg")
     if os.path.exists(img_thumb):
         try:
@@ -322,15 +310,13 @@ def delete_video_and_associated_files(rel_path: str):
         except Exception:
             pass
 
-    # 3. Smazání videa
     if os.path.exists(abs_path):
         try:
             os.remove(abs_path)
-            print(f"[SMAZÁNO] Video: {abs_path}")
+            print(f"[DELETED] Video: {abs_path}")
         except Exception as e:
-            print(f"[!] Nelze smazat video {abs_path}: {e}")
+            print(f"[!] Unable to delete video {abs_path}: {e}")
 
-    # 4. Smazání souvisejících titulků
     folder = os.path.dirname(abs_path)
     base_name = os.path.splitext(os.path.basename(abs_path))[0].lower()
     if os.path.isdir(folder):
@@ -341,15 +327,12 @@ def delete_video_and_associated_files(rel_path: str):
                 if f_base == base_name or f_base.startswith(base_name):
                     try:
                         os.remove(os.path.join(folder, f))
-                        print(f"[SMAZÁNO] Související titulky: {f}")
+                        print(f"[DELETED] Subtitles: {f}")
                     except Exception as e:
-                        print(f"[!] Nelze smazat titulky {f}: {e}")
+                        print(f"[!] Unable to delete subtitles {f}: {e}")
 
-# ==============================================================================
-# HTML KNIHOVNY VIDEÍ
-# ==============================================================================
 LIBRARY_HTML = """<!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -387,13 +370,13 @@ LIBRARY_HTML = """<!DOCTYPE html>
     <div class="container">
         <h1>TC-Media Server</h1>
         <form class="url-form" id="searchForm">
-            <input type="text" id="searchInput" placeholder="Hledat v knihovně...">
+            <input type="text" id="searchInput" placeholder="Search library...">
         </form>
         <div class="actions-bar">
-            <button type="button" id="btnQueue" class="btn-queue" onclick="toggleQueueMode()">Vytvořit frontu</button>
+            <button type="button" id="btnQueue" class="btn-queue" onclick="toggleQueueMode()">Create Queue</button>
         </div>
         <div class="video-list"></div>
-        <div class="loading">Načítám videa...</div>
+        <div class="loading">Loading videos...</div>
     </div>
     <script>
         var page = 1, query = '', loading = false, finished = false;
@@ -408,13 +391,13 @@ LIBRARY_HTML = """<!DOCTYPE html>
             var btn = document.getElementById("btnQueue");
             if (!queueMode) {
                 btn.className = "btn-queue";
-                btn.textContent = "Vytvořit frontu";
+                btn.textContent = "Create Queue";
             } else {
                 btn.className = "btn-queue active";
                 if (queueList.length === 0) {
-                    btn.textContent = "Klikněte na videa pro přidání (Zrušit)";
+                    btn.textContent = "Select videos to queue (Cancel)";
                 } else {
-                    btn.textContent = "Konec a spustit frontu (" + queueList.length + ")";
+                    btn.textContent = "Start Queue (" + queueList.length + ")";
                 }
             }
         }
@@ -470,7 +453,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
         }
 
         function deleteVideo(path, itemElement) {
-            if (!confirm("Opravdu chcete smazat toto video a související titulky z disku?")) return;
+            if (!confirm("Are you sure you want to delete this video and associated subtitles?")) return;
             fetch('/api/delete-video', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -487,10 +470,10 @@ LIBRARY_HTML = """<!DOCTYPE html>
                         renderQueueBadges();
                     }
                 } else {
-                    alert("Chyba při mazání: " + (data.error || "Neznámá chyba"));
+                    alert("Delete failed: " + (data.error || "Unknown error"));
                 }
             })
-            .catch(function(err) { alert("Chyba komunikace se serverem."); });
+            .catch(function() { alert("Server communication error."); });
         }
 
         function escapeHtml(text) {
@@ -527,8 +510,8 @@ LIBRARY_HTML = """<!DOCTYPE html>
                                 '<div class="video-details">' +
                                     '<p title="' + safeTitle + '">' + safeTitle + '</p>' +
                                     '<div class="video-links">' +
-                                        '<a class="btn-play" href="' + playUrl + '">Přehrát</a>' +
-                                        '<button type="button" class="btn-del">Smazat</button>' +
+                                        '<a class="btn-play" href="' + playUrl + '">Play</a>' +
+                                        '<button type="button" class="btn-del">Delete</button>' +
                                     '</div>' +
                                 '</div>';
 
@@ -558,7 +541,7 @@ LIBRARY_HTML = """<!DOCTYPE html>
 
                     if (!data || data.length < 20) {
                         finished = true;
-                        loader.textContent = (page === 1 && (!data || data.length === 0)) ? 'Žádná videa nenalezena v knihovně.' : 'Všechna videa načtena.';
+                        loader.textContent = (page === 1 && (!data || data.length === 0)) ? 'No videos found in library.' : 'All videos loaded.';
                     } else {
                         loader.style.display = 'none';
                     }
@@ -566,8 +549,8 @@ LIBRARY_HTML = """<!DOCTYPE html>
                     renderQueueBadges();
                 })
                 .catch(function(err) {
-                    console.error("Chyba při načítání videí:", err);
-                    loader.textContent = 'Chyba při načítání videí ze serveru.';
+                    console.error("Error loading videos:", err);
+                    loader.textContent = 'Failed to load videos from server.';
                     loading = false;
                 });
         }
@@ -600,11 +583,8 @@ LIBRARY_HTML = """<!DOCTYPE html>
 </html>
 """
 
-# ==============================================================================
-# HTML STRÁNKA PŘEHRÁVAČE S NATIVNÍM ČISTÝM VIDEO.JS
-# ==============================================================================
 def build_player_page(video_path: str) -> str:
-    file_name = os.path.basename(video_path) if video_path else "Přehrávač"
+    file_name = os.path.basename(video_path) if video_path else "Player"
     stream_url = f"/stream?path={urllib.parse.quote(video_path)}" if video_path else ""
 
     track_tags = []
@@ -622,7 +602,7 @@ def build_player_page(video_path: str) -> str:
     buffer_inject = get_buffer_content()
 
     html = f"""<!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
@@ -694,7 +674,7 @@ def build_player_page(video_path: str) -> str:
 </head>
 <body>
     <span id="titleLabel">{file_name}</span>
-    <button id="btnBack">Zpět na seznam</button>
+    <button id="btnBack">Back to library</button>
 
     <div id="bubbleLeft" class="seek-bubble seek-left">-10s</div>
     <div id="bubbleRight" class="seek-bubble seek-right">+10s</div>
@@ -702,11 +682,11 @@ def build_player_page(video_path: str) -> str:
     <div id="resumeModal">
         <div class="modal-box">
             <h2 style="margin-top: 0; color: #ffffff;">{file_name}</h2>
-            <p style="color: #cfd8dc; font-size: 1.15rem; margin-bottom: 8px;">Máte rozkoukané video.</p>
+            <p style="color: #cfd8dc; font-size: 1.15rem; margin-bottom: 8px;">Resume playback?</p>
             <p id="resumeTimeDesc" style="color: #ffb74d; font-size: 1.3rem; font-weight: bold; margin: 10px 0 25px 0;"></p>
             <div>
-                <button id="btnResumeYes" class="btn-resume btn-resume-continue">Pokračovat ve sledování</button>
-                <button id="btnResumeNo" class="btn-resume btn-resume-restart">Pustit od začátku</button>
+                <button id="btnResumeYes" class="btn-resume btn-resume-continue">Resume</button>
+                <button id="btnResumeNo" class="btn-resume btn-resume-restart">Restart from beginning</button>
             </div>
         </div>
     </div>
@@ -714,7 +694,7 @@ def build_player_page(video_path: str) -> str:
     <video id="videoPlayer" class="video-js vjs-big-play-centered" controls preload="auto" crossorigin="anonymous">
         <source src="{stream_url}" type="video/mp4">
 {tracks_html}
-        <p class="vjs-no-js">Povolte JavaScript pro přehrávání videa.</p>
+        <p class="vjs-no-js">Please enable JavaScript to watch this video.</p>
     </video>
     <audio id="altAudio" preload="auto" style="display:none;"></audio>
 
@@ -965,13 +945,12 @@ def build_player_page(video_path: str) -> str:
                 }}
             }}
 
-            // RESUME MODAL LOGIKA
             var savedTime = parseFloat(localStorage.getItem(resumeKey) || "0");
             p.one('loadedmetadata', function() {{
                 var dur = p.duration() || 0;
                 if (savedTime > 15 && (dur <= 0 || savedTime < dur - 25)) {{
                     p.pause();
-                    resumeTimeDesc.textContent = "Rozkoukáno v čase: " + formatSec(savedTime);
+                    resumeTimeDesc.textContent = "Saved position: " + formatSec(savedTime);
                     resumeModal.style.display = "flex";
                     btnResumeYes.focus();
 
@@ -1007,7 +986,6 @@ def build_player_page(video_path: str) -> str:
                 }}
             }});
 
-            // PŘECHOD VE FRONTĚ VIDEÍ
             p.on('ended', function() {{
                 localStorage.removeItem(resumeKey);
                 try {{
@@ -1130,9 +1108,6 @@ def convert_srt_to_vtt(srt_text: str) -> str:
     converted = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', srt_text)
     return vtt + converted
 
-# ==============================================================================
-# HTTP HANDLER
-# ==============================================================================
 class MediaHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -1151,7 +1126,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(content_len).decode("utf-8"))
             rel_path = body.get("path", "")
             if not self.is_safe_path(rel_path):
-                data = json.dumps({"status": "error", "error": "Neplatná cesta"}).encode("utf-8")
+                data = json.dumps({"status": "error", "error": "Invalid path"}).encode("utf-8")
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.end_headers()
@@ -1198,7 +1173,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/videos":
-            # 1. Projdeme všechny soubory na disku
             disk_videos = {}
             for root, _, files in os.walk(MEDIA_DIR):
                 for f in sorted(files):
@@ -1211,7 +1185,6 @@ class MediaHandler(BaseHTTPRequestHandler):
                             rel_dir = ""
                         disk_videos[rel_path] = {"name": f, "path": rel_path, "dir": rel_dir}
 
-            # 2. Seřadíme videa: naposledy sledovaná z urlFolder nahoru, zbytek pod ně
             recent_paths = get_recent_paths_order()
             ordered_videos = []
             seen = set()
@@ -1225,7 +1198,6 @@ class MediaHandler(BaseHTTPRequestHandler):
                 if rp not in seen:
                     ordered_videos.append(vinfo)
 
-            # 3. Vyhledávací filtr
             q_str = query.get("q", [""])[0].lower().strip()
             if q_str:
                 filtered = [v for v in ordered_videos if q_str in v["name"].lower() or q_str in v["dir"].lower()]
@@ -1258,7 +1230,6 @@ class MediaHandler(BaseHTTPRequestHandler):
             return
 
         elif path.startswith("/images/") and path.endswith(".jpg"):
-            # Obsluha obrázku: pokud neexistuje, ffmpeg vygeneruje snímek z poloviny videa
             img_filename = os.path.basename(path)
             target_thumb = os.path.join(FOLDER_IMAGES, img_filename)
 
@@ -1289,7 +1260,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         elif path == "/subtitle":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Titulky nenalezeny")
+                self.send_error(404, "Subtitles not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -1317,7 +1288,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         elif path == "/stream":
             rel_path = query.get("path", [""])[0]
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Video nenalezeno")
+                self.send_error(404, "Video not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -1330,7 +1301,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             start_t = query.get("t", ["0"])[0]
 
             if not self.is_safe_path(rel_path):
-                self.send_error(404, "Zvuk nenalezen")
+                self.send_error(404, "Audio not found")
                 return
 
             full_path = os.path.join(MEDIA_DIR, rel_path.lstrip("/\\"))
@@ -1384,7 +1355,7 @@ class MediaHandler(BaseHTTPRequestHandler):
         try:
             file_size = os.path.getsize(file_path)
         except OSError:
-            self.send_error(404, "Soubor nenalezen")
+            self.send_error(404, "File not found")
             return
 
         mime_type, _ = mimetypes.guess_type(file_path)
@@ -1449,15 +1420,15 @@ class MediaHandler(BaseHTTPRequestHandler):
 
 def run_server():
     print("=== TC-Media Server ===")
-    print(f"Knihovna médií : {MEDIA_DIR}")
-    print(f"Historie (MRU) : {FOLDER_URLS}")
-    print(f"Náhledy (střed): {FOLDER_IMAGES}")
-    print(f"Běží na adrese : http://{HOST}:{PORT}")
+    print(f"Media library  : {MEDIA_DIR}")
+    print(f"History (MRU)  : {FOLDER_URLS}")
+    print(f"Thumbnails     : {FOLDER_IMAGES}")
+    print(f"Running at     : http://{HOST}:{PORT}")
     server = ThreadingHTTPServer((HOST, PORT), MediaHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nUkončuji server...")
+        print("\nShutting down server...")
         server.server_close()
 
 if __name__ == "__main__":

@@ -26,15 +26,19 @@ echo "[i] Media directory  : ${MEDIA_DIR}"
 echo "--------------------------------------------------"
 
 # 1. Update repositories and install required packages
-echo "[+] Updating package list and installing dependencies (python3, qbittorrent-nox, ffmpeg)..."
+echo "[+] Updating package list and installing dependencies..."
 apt-get update
-apt-get install -y python3 qbittorrent-nox ffmpeg
+apt-get install -y python3 python3-requests python3-tk qbittorrent-nox ffmpeg
 
-# 2. Setup shared media folder (/dlna)
-echo "[+] Configuring media directory: ${MEDIA_DIR}..."
+# 2. Setup shared media and working folders with correct permissions
+echo "[+] Configuring media and working directories..."
 mkdir -p "${MEDIA_DIR}"
+mkdir -p "${SCRIPT_DIR}/urlFolder" "${SCRIPT_DIR}/imageFolder"
+
 chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "${MEDIA_DIR}"
 chmod -R 777 "${MEDIA_DIR}"
+
+chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "${SCRIPT_DIR}"
 
 # 3. Create systemd service for TC-Media Web Player
 echo "[+] Creating systemd service: tc-media-player.service..."
